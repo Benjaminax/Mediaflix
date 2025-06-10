@@ -1,0 +1,88 @@
+{
+    "theme": {
+        "@default": {
+            "colours": {
+                "dark_bg": "#141414",
+                "darker_bg": "#0a0a0a",
+                "red_accent": "#e50914",
+                "white_text": "#ffffff",
+                "gray_text": "#8c8c8c"
+            },
+            "misc": {
+                "shape": "rectangle",
+                "shape_corner_radius": "4px"
+            },
+            "font": {
+                "name": "NetflixSans-Regular",
+                "size": "14px",
+                "bold": false,
+                "italic": false
+            }
+        },
+        "button": {
+            "colours": {
+                "normal_bg": "#141414",
+                "hovered_bg": "#222222",
+                "active_bg": "#333333",
+                "selected_bg": "#e50914",
+                "disabled_bg": "#0a0a0a",
+                "normal_text": "#ffffff",
+                "hovered_text": "#ffffff",
+                "active_text": "#ffffff",
+                "selected_text": "#ffffff",
+                "disabled_text": "#8c8c8c",
+                "normal_border": "#333333",
+                "hovered_border": "#444444",
+                "active_border": "#555555",
+                "selected_border": "#e50914",
+                "disabled_border": "#222222"
+            },
+            "misc": {
+                "shape": "rectangle",
+                "shape_corner_radius": "4px",
+                "border_width": "1px"
+            },
+            "font": {
+                "name": "NetflixSans-Medium",
+                "size": "16px",
+                "bold": false,
+                "italic": false
+            }
+        },
+        "@details_buttons": {
+            "colours": {
+                "normal_bg": "#e50914",
+                "hovered_bg": "#f02020",
+                "active_bg": "#c00000",
+                "normal_text": "#ffffff",
+                "hovered_text": "#ffffff",
+                "active_text": "#ffffff"
+            },
+            "misc": {
+                "shape_corner_radius": "4px"
+            },
+            "font": {
+                "size": "18px"
+            }
+        },
+        "text_entry_line": {
+            "colours": {
+                "normal_bg": "#222222",
+                "hovered_bg": "#222222",
+                "active_bg": "#222222",
+                "selected_bg": "#222222",
+                "normal_text": "#ffffff",
+                "hovered_text": "#ffffff",
+                "active_text": "#ffffff",
+                "selected_text": "#ffffff",
+                "normal_border": "#333333",
+                "hovered_border": "#444444",
+                "active_border": "#e50914"
+            },
+            "misc": {
+                "shape_corner_radius": "4px",
+                "border_width": "1px"
+            }
+        }
+    }
+}
