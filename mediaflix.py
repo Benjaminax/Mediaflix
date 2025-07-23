@@ -34,7 +34,9 @@ media_extensions = ['.mp4', '.mkv', '.avi', '.mov']
 TMDB_API_KEY = "875bd4ff3b965afae93faa3d789f6d7e"  # Get one from https://www.themoviedb.org/
 TMDB_API_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_URL = "https://image.tmdb.org/t/p/w500"
+TMDB_BACKDROP_URL = "https://image.tmdb.org/t/p/original"  # Higher resolution for backdrops
 POSTER_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "posters")
+BACKDROP_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "backdrops")
 SYNOPSIS_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "synopsis")
 
 # Set up logging
@@ -96,7 +98,7 @@ class CacheClearThread(QThread):
                 os.remove(file_path)
             except Exception as e:
                 logging.error(f"Error deleting file {file_path}: {str(e)}")
-        for cache_dir in [POSTER_CACHE_DIR, SYNOPSIS_CACHE_DIR]:
+        for cache_dir in [POSTER_CACHE_DIR, BACKDROP_CACHE_DIR, SYNOPSIS_CACHE_DIR]:
             if os.path.exists(cache_dir):
                 files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if os.path.isfile(os.path.join(cache_dir, f))]
                 with ThreadPoolExecutor(max_workers=8) as executor:
@@ -336,23 +338,56 @@ class ImageItem(QListWidgetItem):
             self.synopsis = "Synopsis not available"
 
 class PosterLoader(QObject):
-    """Thread-safe poster loader with signals"""
+    """Thread-safe poster and backdrop loader with signals and caching"""
     poster_loaded = pyqtSignal(object, QPixmap)  # label, pixmap
     poster_failed = pyqtSignal(object, str)      # label, fallback_icon
+    poster_offline = pyqtSignal(object, str)     # label, fallback_icon 
+    backdrop_loaded = pyqtSignal(object, QPixmap)  # label, pixmap
+    backdrop_failed = pyqtSignal(object, str)      # label, fallback_icon
+    backdrop_offline = pyqtSignal(object, str)     # label, title
     
     def load_poster(self, label, poster_path, fallback_icon):
         """Load poster in background thread and emit signal when done"""
         def load_image():
             try:
-                image_url = f"{TMDB_IMAGE_URL}{poster_path}"
+                # Create cache filename based on poster path
+                cache_filename = f"{poster_path.strip('/').replace('/', '_')}.jpg"
+                cache_path = os.path.join(POSTER_CACHE_DIR, cache_filename)
+                os.makedirs(POSTER_CACHE_DIR, exist_ok=True)
                 
+                # Try loading from cache first
+                if os.path.exists(cache_path):
+                    pixmap = QPixmap(cache_path)
+                    if not pixmap.isNull():
+                        self.poster_loaded.emit(label, pixmap)
+                        return
+                
+                # Check internet connection before attempting download
+                try:
+                    requests.get("https://api.themoviedb.org/3", timeout=1)
+                    internet_available = True
+                except (requests.ConnectionError, requests.Timeout, Exception):
+                    internet_available = False
+                
+                if not internet_available:
+                    # For posters, we can use the standard fallback since they're smaller UI elements
+                    self.poster_offline.emit(label, fallback_icon)
+                    return
+                
+                # Download if not cached and internet is available
+                image_url = f"{TMDB_IMAGE_URL}{poster_path}"
                 response = requests.get(image_url, timeout=10)
                 if response.status_code == 200:
-                    
                     pixmap = QPixmap()
                     success = pixmap.loadFromData(response.content)
                     
                     if success and not pixmap.isNull():
+                        # Save to cache
+                        try:
+                            pixmap.save(cache_path, "JPG")
+                        except Exception:
+                            pass  # Cache save failed, but continue
+                        
                         self.poster_loaded.emit(label, pixmap)
                         return
                 
@@ -362,6 +397,318 @@ class PosterLoader(QObject):
                 self.poster_failed.emit(label, fallback_icon)
         
         threading.Thread(target=load_image, daemon=True).start()
+
+    def load_backdrop(self, label, backdrop_path, fallback_icon, title=""):
+        """Load backdrop in background thread with caching and emit signal when done"""
+        def load_backdrop_image():
+            try:
+                # Create cache filename based on backdrop path and title
+                safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+                cache_filename = f"{backdrop_path.strip('/').replace('/', '_')}_{safe_title}.jpg".replace(' ', '_')
+                cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_filename)
+                os.makedirs(BACKDROP_CACHE_DIR, exist_ok=True)
+                
+                # Try loading from cache first (original cache)
+                if os.path.exists(cache_path):
+                    pixmap = QPixmap(cache_path)
+                    if not pixmap.isNull():
+                        self.backdrop_loaded.emit(label, pixmap)
+                        return
+                
+                # Try loading from preloaded cache (movie or TV) with multiple fallback strategies
+                backdrop_found = False
+                
+                # Strategy 1: Check for movie cache format (with and without year)
+                for year_suffix in ["_no_year", ""]:
+                    movie_cache_filename = f"movie_{safe_title}{year_suffix}.jpg".replace(' ', '_')
+                    movie_cache_path = os.path.join(BACKDROP_CACHE_DIR, movie_cache_filename)
+                    if os.path.exists(movie_cache_path):
+                        pixmap = QPixmap(movie_cache_path)
+                        if not pixmap.isNull():
+                            self.backdrop_loaded.emit(label, pixmap)
+                            backdrop_found = True
+                            break
+                
+                if not backdrop_found:
+                    # Strategy 2: Check for TV cache format (with and without year)
+                    for year_suffix in ["_no_year", ""]:
+                        tv_cache_filename = f"tv_{safe_title}{year_suffix}.jpg".replace(' ', '_')
+                        tv_cache_path = os.path.join(BACKDROP_CACHE_DIR, tv_cache_filename)
+                        if os.path.exists(tv_cache_path):
+                            pixmap = QPixmap(tv_cache_path)
+                            if not pixmap.isNull():
+                                self.backdrop_loaded.emit(label, pixmap)
+                                backdrop_found = True
+                                break
+                
+                if not backdrop_found:
+                    # Strategy 3: Fuzzy search - find any similar cached files
+                    try:
+                        # Clean the title for better matching
+                        clean_title = safe_title.lower().replace(' ', '').replace('-', '').replace('_', '')
+                        
+                        for cached_file in os.listdir(BACKDROP_CACHE_DIR):
+                            if cached_file.endswith('.jpg'):
+                                # Extract the title part from cached filename
+                                if cached_file.startswith('movie_') or cached_file.startswith('tv_'):
+                                    cached_title_part = cached_file[6:] if cached_file.startswith('movie_') else cached_file[3:]
+                                    cached_title_part = cached_title_part.split('_')[0].lower()  # Get title before year/extension
+                                    
+                                    # Check if titles are similar (contains or partial match)
+                                    if (clean_title in cached_title_part or 
+                                        cached_title_part in clean_title or
+                                        len(set(clean_title.split()) & set(cached_title_part.split())) > 0):
+                                        
+                                        similar_cache_path = os.path.join(BACKDROP_CACHE_DIR, cached_file)
+                                        pixmap = QPixmap(similar_cache_path)
+                                        if not pixmap.isNull():
+                                            self.backdrop_loaded.emit(label, pixmap)
+                                            backdrop_found = True
+                                            logging.info(f"Found similar backdrop: {cached_file} for {title}")
+                                            break
+                    except Exception as e:
+                        logging.error(f"Error in fuzzy backdrop search: {str(e)}")
+                
+                # If still no backdrop found, check internet and try download
+                if not backdrop_found:
+                    # Check internet connection before attempting download
+                    try:
+                        requests.get("https://api.themoviedb.org/3", timeout=1)
+                        internet_available = True
+                    except (requests.ConnectionError, requests.Timeout, Exception):
+                        internet_available = False
+                    
+                    if not internet_available:
+                        # Emit special offline signal instead of fallback
+                        self.backdrop_offline.emit(label, title)
+                        return
+                
+                # Download if not cached and internet is available
+                image_url = f"{TMDB_BACKDROP_URL}{backdrop_path}"
+                response = requests.get(image_url, timeout=15)  # Longer timeout for larger images
+                if response.status_code == 200:
+                    pixmap = QPixmap()
+                    success = pixmap.loadFromData(response.content)
+                    
+                    if success and not pixmap.isNull():
+                        # Save to cache
+                        try:
+                            # Save at high quality for backdrops
+                            pixmap.save(cache_path, "JPG", 90)
+                        except Exception:
+                            pass  # Cache save failed, but continue
+                        
+                        self.backdrop_loaded.emit(label, pixmap)
+                        return
+                
+                self.backdrop_failed.emit(label, fallback_icon)
+                
+            except Exception as e:
+                self.backdrop_failed.emit(label, fallback_icon)
+        
+        threading.Thread(target=load_backdrop_image, daemon=True).start()
+
+class BackdropCachePreloader(QThread):
+    """
+    Background thread to preload backdrops for all movies and series.
+    
+    This class scans the movies and series folders, identifies all media files,
+    extracts titles and metadata, searches TMDB for backdrop images, and downloads
+    them to cache for offline viewing. The process runs in the background and
+    provides progress updates.
+    
+    Features:
+    - Automatically detects movies and TV series
+    - Downloads high-quality backdrop images
+    - Caches with organized naming for fast lookup
+    - Respects API rate limits with delays
+    - Provides progress feedback
+    - Can be stopped gracefully
+    """
+    progress_updated = pyqtSignal(str, int, int)  # status, current, total
+    cache_completed = pyqtSignal()
+    
+    def __init__(self):
+        super().__init__()
+        self.should_stop = False
+        
+    def stop(self):
+        self.should_stop = True
+        
+    def run(self):
+        """Run the backdrop preloading in background"""
+        try:
+            # Don't check internet here - assume it's already checked by caller
+            logging.info("Backdrop cache preloader started")
+            
+            # Create cache directories
+            os.makedirs(BACKDROP_CACHE_DIR, exist_ok=True)
+            os.makedirs(POSTER_CACHE_DIR, exist_ok=True)
+            
+            # Get all media files
+            all_media_files = []
+            
+            # Scan movies folder
+            if os.path.exists(movies_folder):
+                for file_name in os.listdir(movies_folder):
+                    if any(file_name.lower().endswith(ext) for ext in media_extensions):
+                        all_media_files.append(('movie', os.path.join(movies_folder, file_name)))
+            
+            # Scan series folder
+            if os.path.exists(series_folder):
+                for root, dirs, files in os.walk(series_folder):
+                    for file_name in files:
+                        if any(file_name.lower().endswith(ext) for ext in media_extensions):
+                            all_media_files.append(('series', os.path.join(root, file_name)))
+            
+            if not all_media_files:
+                self.progress_updated.emit("No media files found", 0, 0)
+                return
+            
+            total_files = len(all_media_files)
+            self.progress_updated.emit(f"Starting backdrop cache for {total_files} media files", 0, total_files)
+            
+            # Process each media file
+            processed = 0
+            cached_count = 0
+            
+            for media_type, file_path in all_media_files:
+                if self.should_stop:
+                    break
+                    
+                try:
+                    processed += 1
+                    file_name = os.path.basename(file_path)
+                    display_name = os.path.splitext(file_name)[0]
+                    
+                    if media_type == 'movie':
+                        # Process movie
+                        search_title = self.extract_movie_title(display_name)
+                        search_year = extract_year(display_name)
+                        if self.cache_movie_backdrop(search_title, search_year):
+                            cached_count += 1
+                        self.progress_updated.emit(f"Cached movie: {search_title}", processed, total_files)
+                    else:
+                        # Process series
+                        series_info = extract_series_info(file_name)
+                        if series_info[0]:  # If series name found
+                            series_name = series_info[0]
+                            year = series_info[2]
+                            if self.cache_series_backdrop(series_name, year):
+                                cached_count += 1
+                            self.progress_updated.emit(f"Cached series: {series_name}", processed, total_files)
+                    
+                    # Reduce delay to speed up caching - but prevent overwhelming the API
+                    time.sleep(0.05)  # Reduced from 0.1 to 0.05 seconds
+                    
+                except Exception as e:
+                    logging.error(f"Error caching backdrop for {file_path}: {str(e)}")
+                    continue
+            
+            completion_msg = f"Backdrop cache complete! Cached {cached_count} new backdrops from {processed} media files"
+            self.progress_updated.emit(completion_msg, processed, total_files)
+            self.cache_completed.emit()
+            
+        except Exception as e:
+            logging.error(f"Error in backdrop cache preloader: {str(e)}")
+            self.progress_updated.emit(f"Cache error: {str(e)}", 0, 0)
+    
+    def extract_movie_title(self, name):
+        """Extract movie title by removing file extensions and year"""
+        clean = name.replace('.', ' ').replace('_', ' ')
+        match = re.search(r'(19|20)\d{2}', clean)
+        if match:
+            return clean[:match.start()].strip()
+        return clean.strip()
+    
+    def cache_movie_backdrop(self, title, year=None):
+        """Cache backdrop for a movie - returns True if cached, False if skipped"""
+        try:
+            # Check if already cached
+            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+            cache_filename = f"movie_{safe_title}_{year or 'no_year'}.jpg".replace(' ', '_')
+            cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_filename)
+            
+            if os.path.exists(cache_path):
+                return False  # Already cached, skip
+            
+            # Search TMDB
+            params = {"api_key": TMDB_API_KEY, "query": title}
+            if year:
+                params["year"] = year
+            
+            search_url = f"{TMDB_API_URL}/search/movie"
+            response = requests.get(search_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            backdrop_path = None
+            for result in data.get("results", [])[:1]:  # Just take first result
+                backdrop_path = result.get("backdrop_path")
+                if backdrop_path:
+                    break
+            
+            if backdrop_path:
+                success = self.download_and_cache_backdrop(backdrop_path, cache_path)
+                return success
+                
+        except Exception as e:
+            logging.error(f"Error caching movie backdrop for {title}: {str(e)}")
+        
+        return False
+    
+    def cache_series_backdrop(self, series_name, year=None):
+        """Cache backdrop for a TV series - returns True if cached, False if skipped"""
+        try:
+            # Check if already cached
+            safe_title = "".join(c for c in series_name if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+            cache_filename = f"tv_{safe_title}_{year or 'no_year'}.jpg".replace(' ', '_')
+            cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_filename)
+            
+            if os.path.exists(cache_path):
+                return False  # Already cached, skip
+            
+            # Search TMDB
+            params = {"api_key": TMDB_API_KEY, "query": series_name}
+            if year:
+                params["first_air_date_year"] = year
+            
+            search_url = f"{TMDB_API_URL}/search/tv"
+            response = requests.get(search_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            backdrop_path = None
+            for result in data.get("results", [])[:1]:  # Just take first result
+                backdrop_path = result.get("backdrop_path")
+                if backdrop_path:
+                    break
+            
+            if backdrop_path:
+                success = self.download_and_cache_backdrop(backdrop_path, cache_path)
+                return success
+                
+        except Exception as e:
+            logging.error(f"Error caching series backdrop for {series_name}: {str(e)}")
+        
+        return False
+    
+    def download_and_cache_backdrop(self, backdrop_path, cache_path):
+        """Download and save backdrop to cache - returns True on success"""
+        try:
+            image_url = f"{TMDB_BACKDROP_URL}{backdrop_path}"
+            response = requests.get(image_url, timeout=15)
+            
+            if response.status_code == 200:
+                # Save directly to file
+                with open(cache_path, 'wb') as f:
+                    f.write(response.content)
+                return True
+                    
+        except Exception as e:
+            logging.error(f"Error downloading backdrop {backdrop_path}: {str(e)}")
+        
+        return False
 
 class MediaOrganizerApp(QMainWindow):
     def __init__(self):
@@ -388,6 +735,15 @@ class MediaOrganizerApp(QMainWindow):
         self.poster_loader = PosterLoader()
         self.poster_loader.poster_loaded.connect(self.on_poster_loaded)
         self.poster_loader.poster_failed.connect(self.on_poster_failed)
+        self.poster_loader.poster_offline.connect(self.on_poster_offline)
+        self.poster_loader.backdrop_loaded.connect(self.on_backdrop_loaded)
+        self.poster_loader.backdrop_failed.connect(self.on_backdrop_failed)
+        self.poster_loader.backdrop_offline.connect(self.on_backdrop_offline)
+        
+        # Initialize backdrop cache preloader
+        self.backdrop_preloader = BackdropCachePreloader()
+        self.backdrop_preloader.progress_updated.connect(self.on_cache_progress_updated)
+        self.backdrop_preloader.cache_completed.connect(self.on_cache_completed)
         
         self.load_custom_fonts()
         self.set_dark_theme()
@@ -408,12 +764,21 @@ class MediaOrganizerApp(QMainWindow):
         # Load media lists in background
         QTimer.singleShot(100, self.update_media_lists_async)
         
+        # Start backdrop cache preloading immediately when internet is available
+        QTimer.singleShot(500, self.check_internet_and_start_cache)  # Start checking after 0.5 seconds
+        
         # Setup automatic content rotation timer (refresh every 10 minutes)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_home_content)
         self.auto_refresh_timer.start(600000)  # 10 minutes = 600,000 milliseconds
         
         self.setWindowIcon(QIcon(self.create_netflix_icon()))
+
+    def closeEvent(self, event):
+        """Handle app closing - cleanup backdrop preloader"""
+        if hasattr(self, 'backdrop_preloader'):
+            self.stop_backdrop_cache_preload()
+        super().closeEvent(event)
 
     def resizeEvent(self, event):
         """Handle window resize events and update banner sizes accordingly"""
@@ -796,6 +1161,186 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.populate_series_list()
         self.setEnabled(True)
         QMessageBox.information(self, "Refreshed", "Cache cleared and media lists refreshed!")
+    
+    def start_backdrop_cache_preload(self):
+        """Start the backdrop cache preloading in background"""
+        if not self.backdrop_preloader.isRunning():
+            logging.info("Starting backdrop cache preload...")
+            self.backdrop_preloader.start()
+    
+    def check_internet_and_start_cache(self):
+        """Check for internet connection and start backdrop caching immediately"""
+        try:
+            # Quick internet check with TMDB API key
+            response = requests.get(
+                "https://api.themoviedb.org/3/configuration", 
+                params={"api_key": TMDB_API_KEY},
+                timeout=5
+            )
+            if response.status_code == 200:
+                # Internet is available, start backdrop caching immediately
+                logging.info("Internet detected - starting immediate backdrop cache preload")
+                self.start_backdrop_cache_preload()
+            else:
+                # Retry after 5 seconds
+                logging.info(f"Internet check failed (status {response.status_code}) - retrying in 5 seconds")
+                QTimer.singleShot(5000, self.check_internet_and_start_cache)
+        except requests.ConnectionError as e:
+            # No internet, retry after 5 seconds
+            logging.info("Internet not available - retrying in 5 seconds")
+            QTimer.singleShot(5000, self.check_internet_and_start_cache)
+        except requests.Timeout as e:
+            # Timeout, retry after 5 seconds
+            logging.info("Internet check timeout - retrying in 5 seconds")
+            QTimer.singleShot(5000, self.check_internet_and_start_cache)
+        except Exception as e:
+            # Other error, retry after 5 seconds
+            logging.info(f"Internet check error: {str(e)} - retrying in 5 seconds")
+            QTimer.singleShot(5000, self.check_internet_and_start_cache)
+    
+    def on_cache_progress_updated(self, status, current, total):
+        """Handle backdrop cache progress updates"""
+        if total > 0:
+            progress_percent = int((current / total) * 100)
+            # Update window title with progress (more detailed indication)
+            if progress_percent < 100:
+                self.setWindowTitle(f"Mediaflix - Downloading backdrops {progress_percent}% ({current}/{total})")
+            else:
+                self.setWindowTitle("Mediaflix - Backdrop download complete!")
+                # Reset title after 5 seconds
+                QTimer.singleShot(5000, lambda: self.setWindowTitle("Mediaflix"))
+            logging.info(f"Backdrop cache: {status} ({current}/{total}) - {progress_percent}%")
+        else:
+            logging.info(f"Backdrop cache: {status}")
+            # Show status in title for non-progress messages
+            if "error" not in status.lower():
+                self.setWindowTitle(f"Mediaflix - {status}")
+                QTimer.singleShot(3000, lambda: self.setWindowTitle("Mediaflix"))
+    
+    def on_cache_completed(self):
+        """Handle backdrop cache completion"""
+        logging.info("Backdrop cache preload completed!")
+        # Show completion in title briefly
+        self.setWindowTitle("Mediaflix - All backdrops ready for offline viewing!")
+        # Reset window title after 5 seconds
+        QTimer.singleShot(5000, lambda: self.setWindowTitle("Mediaflix"))
+        
+    def stop_backdrop_cache_preload(self):
+        """Stop the backdrop cache preloading"""
+        if self.backdrop_preloader.isRunning():
+            self.backdrop_preloader.stop()
+            self.backdrop_preloader.wait(5000)  # Wait up to 5 seconds for cleanup
+    
+    def manual_backdrop_preload(self, button):
+        """Manually trigger backdrop preload from settings"""
+        if self.backdrop_preloader.isRunning():
+            # Stop current preload
+            self.stop_backdrop_cache_preload()
+            button.setText("🚀 Start Cache")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #E50914;
+                    color: white;
+                    border: none;
+                    padding: 10px 18px;
+                    font-size: 13px;
+                    border-radius: 6px;
+                    font-weight: 600;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #F40612;
+                }
+                QPushButton:pressed {
+                    background-color: #B00710;
+                }
+            """)
+        else:
+            # Start preload
+            self.backdrop_preloader = BackdropCachePreloader()
+            self.backdrop_preloader.progress_updated.connect(self.on_cache_progress_updated)
+            self.backdrop_preloader.cache_completed.connect(lambda: self.manual_cache_completed(button))
+            self.backdrop_preloader.start()
+            
+            button.setText("⏹️ Stop")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #666666;
+                    color: white;
+                    border: none;
+                    padding: 10px 18px;
+                    font-size: 13px;
+                    border-radius: 6px;
+                    font-weight: 600;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #777777;
+                }
+            """)
+    
+    def manual_cache_completed(self, button):
+        """Handle manual cache completion"""
+        self.on_cache_completed()
+        button.setText("✅ Done")
+        button.setStyleSheet("""
+            QPushButton {
+                background-color: #28A745;
+                color: white;
+                border: none;
+                padding: 10px 18px;
+                font-size: 13px;
+                border-radius: 6px;
+                font-weight: 600;
+                min-width: 100px;
+            }
+        """)
+        button.setEnabled(False)
+        
+        # Reset button after 3 seconds
+        QTimer.singleShot(3000, lambda: self.reset_cache_button(button))
+    
+    def reset_cache_button(self, button):
+        """Reset the cache button to original state"""
+        button.setText("🚀 Start Cache")
+        button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 10px 18px;
+                font-size: 13px;
+                border-radius: 6px;
+                font-weight: 600;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+            QPushButton:pressed {
+                background-color: #B00710;
+            }
+        """)
+        button.setEnabled(True)
+    
+    def get_cached_backdrop_count(self):
+        """Get count of cached backdrop images"""
+        if not os.path.exists(BACKDROP_CACHE_DIR):
+            return 0
+        try:
+            backdrop_files = [f for f in os.listdir(BACKDROP_CACHE_DIR) if f.endswith('.jpg')]
+            return len(backdrop_files)
+        except Exception:
+            return 0
+    
+    def show_cache_status(self):
+        """Show current cache status"""
+        cached_count = self.get_cached_backdrop_count()
+        QMessageBox.information(
+            self, 
+            "Cache Status", 
+            f"Currently cached: {cached_count} backdrop images\nCache location: {BACKDROP_CACHE_DIR}"
+        )
 
     def create_main_content(self):
         self.content_area = QFrame()
@@ -1927,9 +2472,114 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         except Exception as e:
             pass
 
+    def on_poster_offline(self, label, fallback_icon):
+        """Handle offline poster loading with subtle offline indicator"""
+        try:
+            if label and not label.isHidden():
+                label.clear()
+                label.setText(f"📡\n{fallback_icon}")
+                label.setStyleSheet("""
+                    color: #555; 
+                    font-size: 20px; 
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #2a2a2a, stop:1 #333333);
+                    border-radius: 8px;
+                    border: 2px dashed #444;
+                    text-align: center;
+                    line-height: 1.2;
+                """)
+                label.setAlignment(Qt.AlignCenter)
+        except Exception as e:
+            # Fallback to standard failed handling
+            self.on_poster_failed(label, fallback_icon)
+
     def load_poster_async(self, label, poster_path, fallback_icon):
         """Load poster image asynchronously using signal-slot mechanism"""
         self.poster_loader.load_poster(label, poster_path, fallback_icon)
+
+    def on_backdrop_loaded(self, label, pixmap):
+        """Handle successful backdrop loading"""
+        try:
+            if label and not label.isHidden():
+                label.clear()  # Clear any existing text/pixmap
+                # Store original for resizing
+                label.original_pixmap = pixmap
+                # Add resize event handler
+                label.resizeEvent = lambda event: self.resize_banner(label, event)
+                # Create banner with gradient overlay
+                banner = self.create_poster_banner(pixmap, width=label.width(), height=label.height())
+                label.setPixmap(banner)
+        except Exception as e:
+            pass
+
+    def on_backdrop_failed(self, label, fallback_icon):
+        """Handle failed backdrop loading"""
+        try:
+            if label and not label.isHidden():
+                label.clear()
+                label.setText(fallback_icon)
+                label.setStyleSheet("""
+                    color: #666; 
+                    font-size: 48px; 
+                    background-color: #222;
+                    border-radius: 8px;
+                    text-align: center;
+                """)
+        except Exception as e:
+            pass
+
+    def on_backdrop_offline(self, label, title):
+        """Handle offline backdrop loading with proper offline message"""
+        try:
+            if label and not label.isHidden():
+                label.clear()
+                
+                # Create offline message text
+                offline_text = "📡\n\nOffline Mode\n"
+                if title:
+                    # Truncate long titles
+                    display_title = title[:30] + "..." if len(title) > 30 else title
+                    offline_text += f'"{display_title}"\n\n'
+                offline_text += "Backdrop not available offline\nConnect to internet to view image"
+                
+                label.setText(offline_text)
+                label.setStyleSheet("""
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1a1a1a, stop:1 #2a2a2a);
+                    border-radius: 8px;
+                    border: 2px dashed #444;
+                    text-align: center;
+                    color: #888;
+                    font-size: 14px;
+                    font-family: 'Netflix Sans', 'Arial', sans-serif;
+                    padding: 20px;
+                    line-height: 1.4;
+                """)
+                label.setAlignment(Qt.AlignCenter)
+                label.setWordWrap(True)
+                
+        except Exception as e:
+            # Fallback to simple text if styling fails
+            try:
+                if label and not label.isHidden():
+                    label.clear()
+                    label.setText("📡\nOffline Mode\nNo backdrop available")
+                    label.setStyleSheet("""
+                        color: #666; 
+                        font-size: 16px; 
+                        background-color: #1a1a1a;
+                        border-radius: 8px;
+                        border: 2px dashed #444;
+                        text-align: center;
+                        padding: 20px;
+                    """)
+                    label.setAlignment(Qt.AlignCenter)
+            except:
+                pass
+
+    def load_backdrop_async(self, label, backdrop_path, fallback_icon, title=""):
+        """Load backdrop image asynchronously using signal-slot mechanism"""
+        self.poster_loader.load_backdrop(label, backdrop_path, fallback_icon, title)
 
     def show_home_series_details(self, series_data):
         """Show detailed view for a discovered TV series with trailer option"""
@@ -1958,65 +2608,29 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
         self.home_details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
-        # Banner with backdrop image (Netflix-style horizontal banner)
+        # Banner with backdrop image (Netflix-style horizontal banner) - cached version
         backdrop_path = series_data.get("backdrop_path")
         if backdrop_path:
-            try:
-                # Use w1280 backdrop for high quality Netflix-style banner
-                image_url = f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
-                response = requests.get(image_url, timeout=5)
-                if response.status_code == 200:
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(response.content)
-                    if not pixmap.isNull():
-                        # Create responsive Netflix-style banner that adapts to window size
-                        banner_label = QLabel()
-                        banner_label.setPixmap(pixmap)  # Store original pixmap
-                        banner_label.setScaledContents(True)  # Enable automatic scaling
-                        banner_label.setFixedHeight(300)
-                        banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                        banner_label.setStyleSheet("""
-                            QLabel {
-                                border-radius: 8px;
-                                background-color: #222;
-                            }
-                        """)
-                        # Store pixmap for dynamic resizing
-                        banner_label.original_pixmap = pixmap
-                        banner_label.resizeEvent = lambda event: self.resize_banner(banner_label, event)
-                        self.home_details_layout.addWidget(banner_label)
-            except (requests.ConnectionError, requests.Timeout):
-                logging.error("No internet connection for backdrop image")
-                # Add placeholder banner for no internet with Netflix styling
-                no_image_label = QLabel("📺 No Internet Connection")
-                no_image_label.setStyleSheet("""
-                    background-color: #333;
-                    color: #E50914;
-                    font-size: 24px;
-                    font-weight: bold;
-                    padding: 100px;
-                    border-radius: 12px;
-                    border: 2px solid #555;
-                """)
-                no_image_label.setAlignment(Qt.AlignCenter)
-                no_image_label.setFixedHeight(300)
-                self.home_details_layout.addWidget(no_image_label)
-            except Exception as e:
-                logging.error(f"Error loading backdrop: {str(e)}")
-                # Add error placeholder with better styling
-                error_label = QLabel("🎬 Error Loading Banner")
-                error_label.setStyleSheet("""
-                    background-color: #333;
-                    color: #FFA500;
-                    font-size: 24px;
-                    font-weight: bold;
-                    padding: 100px;
-                    border-radius: 12px;
-                    border: 2px solid #555;
-                """)
-                error_label.setAlignment(Qt.AlignCenter)
-                error_label.setFixedHeight(300)
-                self.home_details_layout.addWidget(error_label)
+            # Create banner label placeholder
+            banner_label = QLabel()
+            banner_label.setFixedHeight(300)
+            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            banner_label.setStyleSheet("""
+                QLabel {
+                    border-radius: 8px;
+                    background-color: #222;
+                    color: #666;
+                    font-size: 48px;
+                    text-align: center;
+                }
+            """)
+            banner_label.setAlignment(Qt.AlignCenter)
+            banner_label.setText("🎬")  # Placeholder while loading
+            self.home_details_layout.addWidget(banner_label)
+            
+            # Load backdrop asynchronously with caching
+            series_title = series_data.get("name", "")
+            self.load_backdrop_async(banner_label, backdrop_path, "🎬", series_title)
 
         # Series details
         details_widget = QWidget()
@@ -2216,67 +2830,29 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
         self.home_details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
-        # Banner with backdrop image (Netflix-style horizontal banner)
+        # Banner with backdrop image (Netflix-style horizontal banner) - cached version
         backdrop_path = movie_data.get("backdrop_path")
         if backdrop_path:
-            try:
-                # Use w1280 backdrop for high quality Netflix-style banner
-                image_url = f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
-                response = requests.get(image_url, timeout=5)
-                if response.status_code == 200:
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(response.content)
-                    if not pixmap.isNull():
-                        # Create responsive Netflix-style banner that adapts to window size
-                        banner_label = QLabel()
-                        banner_label.setPixmap(pixmap)  # Store original pixmap
-                        banner_label.setScaledContents(True)  # Enable automatic scaling
-                        banner_label.setFixedHeight(300)
-                        banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                        banner_label.setStyleSheet("""
-                            QLabel {
-                                border-radius: 8px;
-                                background-color: #222;
-                            }
-                        """)
-                        # Store pixmap for dynamic resizing
-                        banner_label.original_pixmap = pixmap
-                        banner_label.resizeEvent = lambda event: self.resize_banner(banner_label, event)
-                        self.home_details_layout.addWidget(banner_label)
-            except (requests.ConnectionError, requests.Timeout):
-                logging.error("No internet connection for backdrop image")
-                # Add placeholder banner for no internet with Netflix styling
-                no_image_label = QLabel("🎬 No Internet Connection")
-                no_image_label.setStyleSheet("""
-                    background-color: #333;
-                    color: #E50914;
-                    font-size: 24px;
-                    font-weight: bold;
-                    padding: 100px;
-                    border-radius: 12px;
-                    border: 2px solid #555;
-                """)
-                no_image_label.setAlignment(Qt.AlignCenter)
-                no_image_label.setFixedHeight(300)
-                self.home_details_layout.addWidget(no_image_label)
-            except Exception as e:
-                logging.error(f"Error loading backdrop: {str(e)}")
-                # Add error placeholder with better styling
-                error_label = QLabel("🎬 Error Loading Banner")
-                error_label.setStyleSheet("""
-                    background-color: #333;
-                    color: #FFA500;
-                    font-size: 24px;
-                    font-weight: bold;
-                    padding: 100px;
-                    border-radius: 12px;
-                    border: 2px solid #555;
-                """)
-                error_label.setAlignment(Qt.AlignCenter)
-                error_label.setFixedHeight(300)
-                self.home_details_layout.addWidget(error_label)
-            except Exception as e:
-                logging.error(f"Error loading backdrop: {str(e)}")
+            # Create banner label placeholder
+            banner_label = QLabel()
+            banner_label.setFixedHeight(300)
+            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            banner_label.setStyleSheet("""
+                QLabel {
+                    border-radius: 8px;
+                    background-color: #222;
+                    color: #666;
+                    font-size: 48px;
+                    text-align: center;
+                }
+            """)
+            banner_label.setAlignment(Qt.AlignCenter)
+            banner_label.setText("🎬")  # Placeholder while loading
+            self.home_details_layout.addWidget(banner_label)
+            
+            # Load backdrop asynchronously with caching
+            movie_title = movie_data.get("title", "")
+            self.load_backdrop_async(banner_label, backdrop_path, "🎬", movie_title)
 
         # Movie details
         details_widget = QWidget()
@@ -2888,7 +3464,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
         self.episodes_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
-        # Banner with backdrop from TMDB or fallback to poster
+        # Banner with backdrop from TMDB or fallback to poster - cached version
         backdrop_used = False
         series_name = item.text()
         backdrop_data = self.get_tmdb_series_backdrop(series_name)
@@ -2896,53 +3472,78 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         if backdrop_data:
             backdrop_path = backdrop_data.get("backdrop_path")
             if backdrop_path:
-                try:
-                    # Use w1280 backdrop for high quality Netflix-style banner
-                    image_url = f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
-                    response = requests.get(image_url, timeout=5)
-                    if response.status_code == 200:
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(response.content)
-                        if not pixmap.isNull():
-                            # Create responsive Netflix-style banner that adapts to window size
-                            banner_label = QLabel()
-                            banner_label.setPixmap(pixmap)  # Store original pixmap
-                            banner_label.setScaledContents(True)  # Enable automatic scaling
-                            banner_label.setFixedHeight(300)
-                            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                            banner_label.setStyleSheet("""
-                                QLabel {
-                                    border-radius: 8px;
-                                    background-color: #222;
-                                }
-                            """)
-                            # Store pixmap for dynamic resizing
-                            banner_label.original_pixmap = pixmap
-                            banner_label.resizeEvent = lambda event: self.resize_banner(banner_label, event)
-                            self.episodes_layout.addWidget(banner_label)
-                            backdrop_used = True
-                except (requests.ConnectionError, requests.Timeout, Exception):
-                    pass  # Fall back to poster banner
+                # Create banner label placeholder
+                banner_label = QLabel()
+                banner_label.setFixedHeight(300)
+                banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                banner_label.setStyleSheet("""
+                    QLabel {
+                        border-radius: 8px;
+                        background-color: #222;
+                        color: #666;
+                        font-size: 48px;
+                        text-align: center;
+                    }
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setText("📺")  # Placeholder while loading
+                self.episodes_layout.addWidget(banner_label)
+                
+                # Load backdrop asynchronously with caching
+                self.load_backdrop_async(banner_label, backdrop_path, "📺", series_name)
+                backdrop_used = True
         
-        # Fallback to poster banner if backdrop failed
+        # Fallback to cached backdrop search or proper no-backdrop message if backdrop failed
         if not backdrop_used:
-            banner_height = 120
             banner_label = QLabel()
-            poster_path = self.find_series_poster(series_path)
-            if poster_path and os.path.exists(poster_path):
-                pixmap = QPixmap(poster_path)
-            else:
-                pixmap = self.create_series_placeholder(item.text())
-            banner_label.setPixmap(pixmap)
-            banner_label.setScaledContents(True)  # Enable automatic scaling
-            banner_label.setFixedHeight(banner_height)
+            banner_label.setFixedHeight(300)  # Same height as backdrop banner
             banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            banner_label.setStyleSheet("""
-                QLabel {
+            
+            # Try to find cached backdrop for this series
+            cached_backdrop_found = False
+            try:
+                safe_title = "".join(c for c in series_name if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+                
+                # Try different cache filename formats
+                possible_cache_names = [
+                    f"series_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                    f"tv_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                    f"series_{safe_title}_no_year.jpg".replace(' ', '_'),
+                    f"tv_{safe_title}_no_year.jpg".replace(' ', '_'),
+                ]
+                
+                for cache_name in possible_cache_names:
+                    cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_name)
+                    if os.path.exists(cache_path):
+                        cached_pixmap = QPixmap(cache_path)
+                        if not cached_pixmap.isNull():
+                            # Create proper banner with cached backdrop
+                            banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
+                            banner_label.setPixmap(banner)
+                            cached_backdrop_found = True
+                            break
+                
+            except Exception as e:
+                logging.error(f"Error loading cached backdrop for {series_name}: {str(e)}")
+            
+            if not cached_backdrop_found:
+                # Show proper "no backdrop available" message instead of stretched poster
+                banner_label.setText("📺\n\nNo Backdrop Available\nBackdrops will load when online")
+                banner_label.setStyleSheet("""
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1a1a1a, stop:1 #2a2a2a);
                     border-radius: 8px;
-                    background-color: #222;
-                }
-            """)
+                    border: 2px dashed #444;
+                    text-align: center;
+                    color: #888;
+                    font-size: 16px;
+                    font-family: 'Netflix Sans', 'Arial', sans-serif;
+                    padding: 20px;
+                    line-height: 1.4;
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setWordWrap(True)
+            
             self.episodes_layout.addWidget(banner_label)
 
         # Series info
@@ -3393,48 +3994,80 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         if backdrop_data:
             backdrop_path = backdrop_data.get("backdrop_path")
             if backdrop_path:
-                try:
-                    # Use w1280 backdrop for high quality Netflix-style banner
-                    image_url = f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
-                    response = requests.get(image_url, timeout=5)
-                    if response.status_code == 200:
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(response.content)
-                        if not pixmap.isNull():
-                            # Create responsive Netflix-style banner that adapts to window size
-                            banner_label = QLabel()
-                            banner_label.setPixmap(pixmap)  # Store original pixmap
-                            banner_label.setScaledContents(True)  # Enable automatic scaling
-                            banner_label.setFixedHeight(300)
-                            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                            banner_label.setStyleSheet("""
-                                QLabel {
-                                    border-radius: 8px;
-                                    background-color: #222;
-                                }
-                            """)
-                            # Store pixmap for dynamic resizing
-                            banner_label.original_pixmap = pixmap
-                            banner_label.resizeEvent = lambda event: self.resize_banner(banner_label, event)
-                            self.details_layout.addWidget(banner_label)
-                            backdrop_used = True
-                except (requests.ConnectionError, requests.Timeout, Exception):
-                    pass  # Fall back to poster banner
+                # Create banner label placeholder
+                banner_label = QLabel()
+                banner_label.setFixedHeight(300)
+                banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                banner_label.setStyleSheet("""
+                    QLabel {
+                        border-radius: 8px;
+                        background-color: #222;
+                        color: #666;
+                        font-size: 48px;
+                        text-align: center;
+                    }
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setText("🎬")  # Placeholder while loading
+                self.details_layout.addWidget(banner_label)
+                
+                # Load backdrop asynchronously with caching
+                self.load_backdrop_async(banner_label, backdrop_path, "🎬", movie_title)
+                backdrop_used = True
         
-        # Fallback to poster banner if backdrop failed
-        if not backdrop_used and not item.icon().isNull():
+        # Fallback to cached backdrop search or proper no-backdrop message if backdrop failed
+        if not backdrop_used:
             banner_label = QLabel()
-            pixmap = item.icon().pixmap(600, 900)
-            banner_label.setPixmap(pixmap)
-            banner_label.setScaledContents(True)  # Enable automatic scaling
-            banner_label.setFixedHeight(180)
+            banner_label.setFixedHeight(300)  # Same height as backdrop banner
             banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            banner_label.setStyleSheet("""
-                QLabel {
+            
+            # Try to find cached backdrop for this movie
+            cached_backdrop_found = False
+            try:
+                safe_title = "".join(c for c in movie_title if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+                year = extract_year(item.text())
+                
+                # Try different cache filename formats
+                possible_cache_names = [
+                    f"movie_{safe_title}_{year}.jpg".replace(' ', '_') if year else None,
+                    f"movie_{safe_title}_no_year.jpg".replace(' ', '_'),
+                    f"movie_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                ]
+                
+                for cache_name in possible_cache_names:
+                    if cache_name is None:
+                        continue
+                    cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_name)
+                    if os.path.exists(cache_path):
+                        cached_pixmap = QPixmap(cache_path)
+                        if not cached_pixmap.isNull():
+                            # Create proper banner with cached backdrop
+                            banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
+                            banner_label.setPixmap(banner)
+                            cached_backdrop_found = True
+                            break
+                
+            except Exception as e:
+                logging.error(f"Error loading cached backdrop for {movie_title}: {str(e)}")
+            
+            if not cached_backdrop_found:
+                # Show proper "no backdrop available" message instead of stretched poster
+                banner_label.setText("🎬\n\nNo Backdrop Available\nBackdrops will load when online")
+                banner_label.setStyleSheet("""
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1a1a1a, stop:1 #2a2a2a);
                     border-radius: 8px;
-                    background-color: #222;
-                }
-            """)
+                    border: 2px dashed #444;
+                    text-align: center;
+                    color: #888;
+                    font-size: 16px;
+                    font-family: 'Netflix Sans', 'Arial', sans-serif;
+                    padding: 20px;
+                    line-height: 1.4;
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setWordWrap(True)
+            
             self.details_layout.addWidget(banner_label)
 
         details_widget = QWidget()
@@ -4233,6 +4866,126 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         
         downloads_section.layout().addWidget(downloads_content)
         scroll_layout.addWidget(downloads_section)
+        
+        # Cache & Performance Section
+        cache_section = self.create_settings_section(
+            "⚡", "Cache & Performance", "Optimize loading and offline experience"
+        )
+        
+        cache_content = QWidget()
+        cache_layout = QVBoxLayout(cache_content)
+        cache_layout.setContentsMargins(0, 0, 0, 0)
+        cache_layout.setSpacing(15)
+        
+        # Backdrop preloading option
+        backdrop_container = QWidget()
+        backdrop_layout = QHBoxLayout(backdrop_container)
+        backdrop_layout.setContentsMargins(15, 10, 15, 10)
+        backdrop_layout.setSpacing(15)
+        backdrop_container.setStyleSheet("""
+            QWidget {
+                background-color: #222222;
+                border-radius: 8px;
+                border: 1px solid #333333;
+            }
+        """)
+        
+        backdrop_info = QWidget()
+        backdrop_info_layout = QVBoxLayout(backdrop_info)
+        backdrop_info_layout.setContentsMargins(0, 0, 0, 0)
+        backdrop_info_layout.setSpacing(3)
+        
+        backdrop_title = QLabel("🖼️ Preload Backdrops")
+        backdrop_title.setStyleSheet("""
+            font-size: 14px;
+            font-weight: bold;
+            color: white;
+        """)
+        backdrop_info_layout.addWidget(backdrop_title)
+        
+        backdrop_desc = QLabel("Download all movie and TV show backdrops for offline viewing")
+        backdrop_desc.setStyleSheet("""
+            font-size: 12px;
+            color: #AAAAAA;
+            margin: 0px;
+        """)
+        backdrop_desc.setWordWrap(True)
+        backdrop_info_layout.addWidget(backdrop_desc)
+        
+        backdrop_layout.addWidget(backdrop_info, 1)
+        
+        # Preload button
+        preload_btn = QPushButton("🚀 Start Cache")
+        preload_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 10px 18px;
+                font-size: 13px;
+                border-radius: 6px;
+                font-weight: 600;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+            QPushButton:pressed {
+                background-color: #B00710;
+            }
+        """)
+        preload_btn.clicked.connect(lambda: self.manual_backdrop_preload(preload_btn))
+        backdrop_layout.addWidget(preload_btn)
+        
+        cache_layout.addWidget(backdrop_container)
+        
+        # Cache status display
+        status_container = QWidget()
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(15, 10, 15, 10)
+        status_layout.setSpacing(15)
+        status_container.setStyleSheet("""
+            QWidget {
+                background-color: #1A1A1A;
+                border-radius: 8px;
+                border: 1px solid #333333;
+            }
+        """)
+        
+        # Cache info
+        cached_count = self.get_cached_backdrop_count()
+        cache_info = QLabel(f"💾 {cached_count} backdrops cached • Ready for offline viewing")
+        cache_info.setStyleSheet("""
+            font-size: 13px;
+            color: #AAAAAA;
+            font-weight: 500;
+        """)
+        status_layout.addWidget(cache_info, 1)
+        
+        # View cache button
+        view_cache_btn = QPushButton("📊 Status")
+        view_cache_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2D2D2D;
+                color: white;
+                border: 1px solid #555555;
+                padding: 8px 14px;
+                font-size: 12px;
+                border-radius: 6px;
+                font-weight: 500;
+                min-width: 70px;
+            }
+            QPushButton:hover {
+                background-color: #3D3D3D;
+                border-color: #777777;
+            }
+        """)
+        view_cache_btn.clicked.connect(self.show_cache_status)
+        status_layout.addWidget(view_cache_btn)
+        
+        cache_layout.addWidget(status_container)
+        cache_section.layout().addWidget(cache_content)
+        scroll_layout.addWidget(cache_section)
         
         # Refresh & Maintenance Section
         refresh_section = self.create_settings_section(
