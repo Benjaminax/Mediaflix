@@ -1,3 +1,4 @@
+#from curses.ascii import US
 import os
 import shutil
 import re
@@ -13,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QMessageBox, QStackedWidget, QScrollArea, QFrame, QDialog, QLineEdit,
                             QSizePolicy, QSpacerItem, QTextEdit, QComboBox, QGroupBox, QGridLayout, QMenu)
 from PyQt5.QtCore import Qt, QSize, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QObject
-from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QPainter, QFontDatabase, QLinearGradient
+from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QPainter, QFontDatabase, QLinearGradient, QPainterPath
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -155,8 +156,12 @@ class ImageItem(QListWidgetItem):
         painter.drawRect(65, 30, 20, 165)
         
         painter.setPen(QColor(255, 255, 255))
-        font = QFont('Netflix Sans', 10, QFont.Bold)
+        font = QFont('Netflix Sans Bold', 10, QFont.Bold)
+        font.setHintingPreference(QFont.PreferFullHinting)
+        font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
         painter.setFont(font)
+        # Enable text antialiasing for crisp rendering
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
         rect = pixmap.rect().adjusted(10, 180, -10, -10)
         painter.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, self.search_title)
         
@@ -207,6 +212,7 @@ class ImageItem(QListWidgetItem):
 
             # Fetch from TMDB
             params = {"api_key": TMDB_API_KEY, "query": self.search_title}
+            params["region"] = "US"
             if self.search_year:
                 params["year"] = self.search_year
 
@@ -723,6 +729,11 @@ class MediaOrganizerApp(QMainWindow):
         self.active_tab = None  # Track the active tab
         self.current_content_filter = "movie"  # Default content filter for home tab (Movies)
         
+        # Navigation tracking for cast views
+        self.previous_view_stack = []  # Stack to track navigation history
+        self.current_movie_data = None  # Track current movie/series data
+        self.current_series_data = None
+        
         # Loading state flags
         self.media_lists_loaded = False
         self.home_content_loaded = False
@@ -747,6 +758,7 @@ class MediaOrganizerApp(QMainWindow):
         
         self.load_custom_fonts()
         self.set_dark_theme()
+        self.optimize_font_rendering()
         
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
@@ -767,10 +779,10 @@ class MediaOrganizerApp(QMainWindow):
         # Start backdrop cache preloading immediately when internet is available
         QTimer.singleShot(500, self.check_internet_and_start_cache)  # Start checking after 0.5 seconds
         
-        # Setup automatic content rotation timer (refresh every 10 minutes)
+        # Setup automatic content rotation timer (refresh every 20 minutes)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_home_content)
-        self.auto_refresh_timer.start(600000)  # 10 minutes = 600,000 milliseconds
+        self.auto_refresh_timer.start(1200000)  # 20 minutes = 1,200,000 milliseconds
         
         self.setWindowIcon(QIcon(self.create_netflix_icon()))
 
@@ -799,9 +811,40 @@ class MediaOrganizerApp(QMainWindow):
     def load_custom_fonts(self):
         font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
         if os.path.exists(font_dir):
-            QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Bold.otf"))
-            QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Medium.otf"))
-            QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Regular.otf"))
+            # Load custom Netflix Sans fonts
+            bold_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Bold.otf"))
+            medium_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Medium.otf"))
+            regular_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Regular.otf"))
+            
+            # Verify fonts were loaded successfully
+            if bold_id != -1:
+                families = QFontDatabase.applicationFontFamilies(bold_id)
+                if families:
+                    print(f"Successfully loaded Netflix Sans Bold: {families[0]}")
+            
+            if medium_id != -1:
+                families = QFontDatabase.applicationFontFamilies(medium_id)
+                if families:
+                    print(f"Successfully loaded Netflix Sans Medium: {families[0]}")
+                    
+            if regular_id != -1:
+                families = QFontDatabase.applicationFontFamilies(regular_id)
+                if families:
+                    print(f"Successfully loaded Netflix Sans Regular: {families[0]}")
+        
+        # Set application-wide font rendering settings for crisp text
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            # Enable font smoothing and high DPI support
+            app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+            app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+            
+            # Set default application font with proper hinting
+            default_font = QFont("Netflix Sans Medium", 10)
+            default_font.setHintingPreference(QFont.PreferFullHinting)
+            default_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+            app.setFont(default_font)
 
     def set_dark_theme(self):
         dark_palette = QPalette()
@@ -823,25 +866,31 @@ class MediaOrganizerApp(QMainWindow):
 QWidget {
     background-color: #181818;
     color: #ffffff;
-    font-family: Segoe UI, Arial, sans-serif;
+    font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+    font-size: 11px;
 }
 QLineEdit, QListWidget, QTextEdit {
     background-color: #222222;
     color: #ffffff;
     border: 1px solid #444444;
+    font-family: 'Netflix Sans Regular', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+    font-size: 12px;
 }
 QPushButton {
     background-color: #e50914;
     color: #ffffff;
     border-radius: 6px;
     padding: 8px 16px;
-    font-weight: bold;
+    font-weight: 600;
+    font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+    font-size: 12px;
 }
 QPushButton:hover {
     background-color: #b00610;
 }
 QGroupBox, QLabel {
     color: #ffffff;
+    font-family: 'Netflix Sans Regular', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
 }
 /* Modern scroll bars */
 QScrollBar:vertical {
@@ -889,6 +938,68 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 """
 
         self.setStyleSheet(dark_stylesheet)
+
+    def create_crisp_font(self, family="Netflix Sans Medium", size=10, weight=QFont.Normal, bold=False):
+        """Create a font with optimal rendering settings for crisp text display"""
+        # Try the preferred font first, fall back to system fonts if needed
+        font_families = [family, "Netflix Sans", "Segoe UI", "Arial", "sans-serif"]
+        
+        font = None
+        for font_family in font_families:
+            font = QFont(font_family, size, weight)
+            # Check if the font family is actually available
+            font_info = QFontDatabase()
+            available_families = font_info.families()
+            if font_family in available_families or font_family in ["Arial", "sans-serif"]:
+                break
+        
+        if not font:
+            font = QFont("Arial", size, weight)
+        
+        # Enable font hinting for crisp edges
+        font.setHintingPreference(QFont.PreferFullHinting)
+        
+        # Set style strategy for better rendering
+        font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+        
+        # Set weight if bold is requested
+        if bold:
+            font.setBold(True)
+            
+        return font
+
+    def optimize_font_rendering(self):
+        """Optimize font rendering for the entire application"""
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            # Enable font smoothing and better quality rendering
+            app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+            
+            # Set the default font for the entire application
+            try:
+                app_font = self.create_crisp_font("Netflix Sans Medium", 11, QFont.Normal)
+                if app_font:
+                    app.setFont(app_font)
+            except Exception as e:
+                print(f"Could not set application font: {e}")
+                # Fallback to system font with optimizations
+                fallback_font = QFont("Segoe UI", 11)
+                fallback_font.setHintingPreference(QFont.PreferFullHinting)
+                fallback_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+                app.setFont(fallback_font)
+            
+            # Enable font antialiasing globally if possible
+            try:
+                import sys
+                if sys.platform == "win32":
+                    # Windows-specific font smoothing
+                    import ctypes
+                    from ctypes import wintypes
+                    # Enable ClearType
+                    ctypes.windll.gdi32.SystemParametersInfoW(0x1015, 0, True, 0)
+            except Exception:
+                pass  # Ignore errors if platform-specific optimizations fail
 
     def create_netflix_icon(self):
         pixmap = QPixmap(64, 64)
@@ -984,9 +1095,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         
         # Navigation buttons that can remain highlighted (Home, Movies and Series)
         nav_buttons = [
-            (self.home_button, lambda: self.stacked_widget.setCurrentIndex(0)),
-            (self.movies_button, lambda: self.stacked_widget.setCurrentIndex(1)),
-            (self.series_button, self.show_series_window),
+            (self.home_button, self.show_home_tab),
+            (self.movies_button, self.show_movies_tab),
+            (self.series_button, self.show_series_tab),
         ]
         
         for btn, callback in nav_buttons:
@@ -999,16 +1110,22 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     font-size: 16px;
                     border-radius: 0;
                     background-color: transparent;
+                    font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+                    font-weight: 500;
+                    letter-spacing: 0.1px;
                 }
                 QPushButton:hover {
                     background-color: #2D2D2D;
                 }
                 QPushButton:checked {
                     background-color: #E50914;
-                    font-weight: bold;
+                    font-weight: 600;
                 }
             """)
             btn.setCheckable(True)
+            # Apply crisp font to navigation buttons
+            nav_font = self.create_crisp_font("Netflix Sans Medium", 16)
+            btn.setFont(nav_font)
             self.sidebar_layout.addWidget(btn)
 
         # Sort button with special behavior (temporary highlight only)
@@ -1021,12 +1138,18 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 16px;
                 border-radius: 0;
                 background-color: transparent;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+                font-weight: 500;
+                letter-spacing: 0.1px;
             }
             QPushButton:hover {
                 background-color: #2D2D2D;
             }
         """)
         self.sort_button.setCheckable(False)  # Don't allow persistent checking
+        # Apply crisp font to sort button
+        sort_font = self.create_crisp_font("Netflix Sans Medium", 16)
+        self.sort_button.setFont(sort_font)
         self.sidebar_layout.addWidget(self.sort_button)
 
         self.sidebar_layout.addStretch()
@@ -1041,11 +1164,17 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 16px;
                 border-radius: 0;
                 background-color: transparent;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+                font-weight: 500;
+                letter-spacing: 0.1px;
             }
             QPushButton:hover {
                 background-color: #2D2D2D;
             }
         """)
+        # Apply crisp font to settings button
+        settings_font = self.create_crisp_font("Netflix Sans Medium", 16)
+        self.settings_button.setFont(settings_font)
         self.sidebar_layout.addWidget(self.settings_button)
         
         self.main_layout.addWidget(self.sidebar)
@@ -1417,10 +1546,14 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         title_label = QLabel("Discover Movies & Shows")
         title_label.setStyleSheet("""
             font-size: 28px; 
-            font-weight: bold; 
+            font-weight: 700; 
             color: white;
-            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+            letter-spacing: -0.5px;
         """)
+        # Apply crisp font rendering
+        title_font = self.create_crisp_font("Netflix Sans Bold", 28, bold=True)
+        title_label.setFont(title_font)
         title_layout.addWidget(title_label)
         
         underline = QWidget()
@@ -1476,7 +1609,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 15px;
                 font-weight: 500;
                 border-radius: 19px;
-                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+                letter-spacing: 0.2px;
             }
             QPushButton:hover {
                 color: white;
@@ -1485,12 +1619,17 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             QPushButton:checked {
                 background-color: #E50914;
                 color: white;
-                font-weight: bold;
+                font-weight: 600;
             }
         """
         
         self.movies_filter_btn.setStyleSheet(toggle_button_style)
         self.series_filter_btn.setStyleSheet(toggle_button_style)
+        
+        # Apply crisp fonts to filter buttons
+        filter_font = self.create_crisp_font("Netflix Sans Medium", 15)
+        self.movies_filter_btn.setFont(filter_font)
+        self.series_filter_btn.setFont(filter_font)
         
         toggle_layout.addWidget(self.movies_filter_btn)
         toggle_layout.addWidget(self.series_filter_btn)
@@ -1517,9 +1656,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 border: none;
                 padding: 0px;
                 font-size: 18px;
-                font-weight: bold;
+                font-weight: 600;
                 border-radius: 22px;
-                font-family: Arial, sans-serif;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
             }
             QPushButton:hover {
                 background-color: #E50914;
@@ -1529,6 +1668,10 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #B00710;
             }
         """)
+        # Apply crisp font to reload button
+        reload_font = self.create_crisp_font("Netflix Sans Medium", 18)
+        self.reload_home_btn.setFont(reload_font)
+        
         filter_layout.addWidget(self.reload_home_btn)
         
         layout.addWidget(filter_container)
@@ -1579,11 +1722,15 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         text_label = QLabel("Loading Amazing Content...")
         text_label.setStyleSheet("""
             font-size: 20px; 
-            font-weight: bold; 
+            font-weight: 700; 
             color: white;
-            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+            letter-spacing: -0.3px;
         """)
         text_label.setAlignment(Qt.AlignCenter)
+        # Apply crisp font
+        loading_font = self.create_crisp_font("Netflix Sans Bold", 20, bold=True)
+        text_label.setFont(loading_font)
         loading_layout.addWidget(text_label)
         
         # Sub text
@@ -1591,9 +1738,13 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         sub_label.setStyleSheet("""
             font-size: 14px; 
             color: #AAAAAA;
-            font-family: 'Netflix Sans', 'Arial', sans-serif;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+            letter-spacing: 0.1px;
         """)
         sub_label.setAlignment(Qt.AlignCenter)
+        # Apply crisp font
+        sub_font = self.create_crisp_font("Netflix Sans Medium", 14)
+        sub_label.setFont(sub_font)
         loading_layout.addWidget(sub_label)
         
         loading_layout.addStretch()
@@ -1680,7 +1831,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         sub_message.setStyleSheet("""
             font-size: 16px; 
             color: #AAAAAA;
-            font-family: 'Netflix Sans', 'Arial', sans-serif;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
         """)
         sub_message.setAlignment(Qt.AlignCenter)
         sub_message.setWordWrap(True)
@@ -1795,7 +1946,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 18px;
                 font-weight: bold;
                 border-radius: 22px;
-                font-family: Arial, sans-serif;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
             QPushButton:hover {
                 background-color: #E50914;
@@ -1916,34 +2067,31 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         # TV Series genres - All standard TMDB TV genres
         tv_genres = [
             ("🔥 Trending Series", "trending"),  # Use "trending" instead of genre ID
+            ("💖 Romance & Love Stories", 10749),  # Romance (using movie genre ID as TV doesn't have dedicated romance)
+            ("😱 Horror & Supernatural", 27),  # Horror (using movie genre ID)
+            ("🎵 Music & Musicals", 10402),  # Music (using movie genre ID)
             ("⚡ Action & Adventure", 10759),  # Action & Adventure
             ("🎭 Animation", 16),  # Animation
             ("😄 Comedy", 35),  # Comedy
             ("🚔 Crime", 80),  # Crime
-            ("� Documentary", 99),  # Documentary
+            ("📚 Documentary", 99),  # Documentary
             ("🎬 Drama", 18),  # Drama
             ("👨‍👩‍👧‍👦 Family", 10751),  # Family
             ("👶 Kids", 10762),  # Kids
             ("🔍 Mystery", 9648),  # Mystery
-            ("� News", 10763),  # News
             ("📺 Reality", 10764),  # Reality
             ("🌌 Sci-Fi & Fantasy", 10765),  # Sci-Fi & Fantasy
             ("🧼 Soap", 10766),  # Soap
             ("💬 Talk", 10767),  # Talk
             ("⚔️ War & Politics", 10768),  # War & Politics
             ("🤠 Western", 37),  # Western
-            ("💖 Romance", 10749),  # Romance (using movie genre ID as TV doesn't have dedicated romance)
-            ("😱 Horror", 27),  # Horror (using movie genre ID)
-            ("� Music", 10402),  # Music (using movie genre ID)
             ("🎪 Variety Show", 10767),  # Using Talk genre for variety shows
             ("🏥 Medical Drama", 18),  # Using Drama genre for medical shows
             ("🎓 Educational", 99),  # Using Documentary for educational content
             ("🎮 Game Show", 10764),  # Using Reality for game shows
-            ("� Travel", 99),  # Using Documentary for travel shows
+            ("🌍 Travel", 99),  # Using Documentary for travel shows
             ("🍳 Cooking", 10764),  # Using Reality for cooking shows
-            ("� Home & Garden", 10764),  # Using Reality for home improvement
-            ("� Business", 10763),  # Using News for business content
-            ("⚽ Sports", 10763),  # Using News for sports content
+            ("🏠 Home & Garden", 10764),  # Using Reality for home improvement
             ("🧠 Psychological Thriller", 9648)  # Using Mystery for psychological content
         ]
         
@@ -1953,14 +2101,15 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             # Load remaining genres after a delay
             QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, movie_genres[4:], "movie"))
         elif current_filter == "tv":
-            self.load_priority_genres(parent_layout, tv_genres[:5], "tv")  # Reduced from 8 to 5 for faster initial load
+            # Prioritize Romance, Horror, and Music by loading them first (positions 1, 2, 3)
+            self.load_priority_genres(parent_layout, tv_genres[:7], "tv")  # Increased from 5 to 7 to include more priority genres
             # Load remaining genres after a delay
-            QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, tv_genres[5:], "tv"))
+            QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, tv_genres[7:], "tv"))
 
     def load_priority_genres(self, parent_layout, genres, content_type):
         """Load priority genres immediately for faster initial display - optimized"""
-        # Load fewer initial genres for faster startup
-        priority_count = 4 if content_type == "movie" else 5  # Reduced counts for faster loading
+        # Load different counts based on content type - more for TV to include Romance, Horror, Music
+        priority_count = 4 if content_type == "movie" else 7  # Increased TV from 5 to 7 to match the slice in create_genre_sections_async
         for i, (genre_name, genre_id) in enumerate(genres[:priority_count]):
             # Create genre widget immediately
             genre_widget = self.create_fast_genre_row(genre_name, genre_id, content_type=content_type)
@@ -2012,11 +2161,15 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         genre_title = QLabel(genre_name)
         genre_title.setStyleSheet("""
             font-size: 20px; 
-            font-weight: bold; 
+            font-weight: 700; 
             color: white;
-            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
             margin-bottom: 5px;
+            letter-spacing: -0.2px;
         """)
+        # Apply crisp font to genre title
+        genre_font = self.create_crisp_font("Netflix Sans Bold", 20, bold=True)
+        genre_title.setFont(genre_font)
         genre_layout.addWidget(genre_title)
         
         # Horizontal scroll area for movie/series posters
@@ -2024,7 +2177,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         scroll_area.setWidgetResizable(False)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setFixedHeight(240)
+        scroll_area.setFixedHeight(280)  # Increased from 240 to accommodate titles
         scroll_area.setStyleSheet("""
             QScrollArea {
                 border: none;
@@ -2049,6 +2202,1240 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         genre_layout.addWidget(scroll_area)
         
         return genre_container
+    
+    def get_similar_content(self, content_id, content_type="movie", limit=10):
+        """Get enhanced similar movies or TV series using multiple recommendation strategies"""
+        try:
+            # First, get basic details about the current content
+            content_details = self.get_content_details(content_id, content_type)
+            if not content_details:
+                return []
+            
+            # Strategy 1: TMDB Similar API (primary source)
+            similar_from_api = self.get_tmdb_similar_content(content_id, content_type, limit=15)
+            
+            # Strategy 2: Genre-based recommendations
+            genre_based = self.get_genre_based_recommendations(content_details, content_type, limit=15)
+            
+            # Strategy 3: Cast/Director-based recommendations  
+            cast_based = self.get_cast_based_recommendations(content_details, content_type, limit=10)
+            
+            # Strategy 4: Get trending content in same genres as backup
+            trending_backup = self.get_trending_in_genres(content_details.get('genre_ids', []), content_type, limit=10)
+            
+            # Combine and rank all recommendations
+            all_recommendations = []
+            
+            # Add TMDB similar content with high priority
+            for item in similar_from_api:
+                if item.get('id') != content_id:  # Don't recommend the same content
+                    score = self.calculate_recommendation_score(item, content_details, 'tmdb_similar')
+                    all_recommendations.append((item, score, 'tmdb_similar'))
+            
+            # Add genre-based recommendations with medium priority
+            for item in genre_based:
+                if item.get('id') != content_id and not self.is_duplicate_recommendation(item, all_recommendations):
+                    score = self.calculate_recommendation_score(item, content_details, 'genre_based')
+                    all_recommendations.append((item, score, 'genre_based'))
+            
+            # Add cast-based recommendations with medium priority
+            for item in cast_based:
+                if item.get('id') != content_id and not self.is_duplicate_recommendation(item, all_recommendations):
+                    score = self.calculate_recommendation_score(item, content_details, 'cast_based')
+                    all_recommendations.append((item, score, 'cast_based'))
+            
+            # Add trending backup with lower priority
+            for item in trending_backup:
+                if item.get('id') != content_id and not self.is_duplicate_recommendation(item, all_recommendations):
+                    score = self.calculate_recommendation_score(item, content_details, 'trending')
+                    all_recommendations.append((item, score, 'trending'))
+            
+            # Sort by score (highest first) and return top recommendations
+            all_recommendations.sort(key=lambda x: x[1], reverse=True)
+            
+            # Ensure diversity in recommendations (avoid too many from same genre/year)
+            diverse_recommendations = self.ensure_recommendation_diversity(all_recommendations, limit)
+            
+            # Return just the content items
+            return [rec[0] for rec in diverse_recommendations]
+                
+        except Exception as e:
+            logging.error(f"Error getting enhanced similar content: {str(e)}")
+            # Fallback to basic TMDB similar if enhanced method fails
+            return self.get_tmdb_similar_content(content_id, content_type, limit)
+
+    def get_content_details(self, content_id, content_type="movie"):
+        """Get detailed information about content for better recommendations"""
+        try:
+            if content_type == "movie":
+                url = f"https://api.themoviedb.org/3/movie/{content_id}"
+            else:
+                url = f"https://api.themoviedb.org/3/tv/{content_id}"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY,
+                "append_to_response": "credits,keywords"
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                return response.json()
+            return None
+                
+        except Exception as e:
+            logging.error(f"Error getting content details: {str(e)}")
+            return None
+
+    def get_tmdb_similar_content(self, content_id, content_type="movie", limit=10):
+        """Get similar content from TMDB API (original method)"""
+        try:
+            if content_type == "movie":
+                url = f"https://api.themoviedb.org/3/movie/{content_id}/similar"
+            else:
+                url = f"https://api.themoviedb.org/3/tv/{content_id}/similar"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY,
+                "page": 1
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get("results", [])[:limit]
+                return results
+            return []
+                
+        except Exception as e:
+            logging.error(f"Error getting TMDB similar content: {str(e)}")
+            return []
+
+    def get_genre_based_recommendations(self, content_details, content_type="movie", limit=15):
+        """Get recommendations based on matching genres"""
+        try:
+            genre_ids = content_details.get('genre_ids', content_details.get('genres', []))
+            if isinstance(genre_ids, list) and len(genre_ids) > 0:
+                # If genres is a list of objects, extract IDs
+                if isinstance(genre_ids[0], dict):
+                    genre_ids = [g['id'] for g in genre_ids]
+                
+                # Get content from same genres, sorted by popularity
+                if content_type == "movie":
+                    url = "https://api.themoviedb.org/3/discover/movie"
+                else:
+                    url = "https://api.themoviedb.org/3/discover/tv"
+                
+                response = requests.get(url, params={
+                    "api_key": TMDB_API_KEY,
+                    "with_genres": ",".join(map(str, genre_ids[:3])),  # Use top 3 genres
+                    "sort_by": "vote_average.desc",
+                    "vote_count.gte": 100,  # Ensure quality content
+                    "page": 1
+                }, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get("results", [])[:limit]
+            return []
+                
+        except Exception as e:
+            logging.error(f"Error getting genre-based recommendations: {str(e)}")
+            return []
+
+    def get_cast_based_recommendations(self, content_details, content_type="movie", limit=10):
+        """Get recommendations based on cast and crew"""
+        try:
+            recommendations = []
+            credits = content_details.get('credits', {})
+            
+            # Get recommendations based on main actors (top 3)
+            cast = credits.get('cast', [])[:3]
+            for actor in cast:
+                actor_id = actor.get('id')
+                if actor_id:
+                    actor_content = self.get_content_by_person(actor_id, content_type, limit=5)
+                    recommendations.extend(actor_content)
+            
+            # Get recommendations based on director/creator
+            crew = credits.get('crew', [])
+            directors = [c for c in crew if c.get('job') in ['Director', 'Creator']][:2]
+            for director in directors:
+                director_id = director.get('id')
+                if director_id:
+                    director_content = self.get_content_by_person(director_id, content_type, limit=5)
+                    recommendations.extend(director_content)
+            
+            return recommendations[:limit]
+                
+        except Exception as e:
+            logging.error(f"Error getting cast-based recommendations: {str(e)}")
+            return []
+
+    def get_content_by_person(self, person_id, content_type="movie", limit=5):
+        """Get content featuring a specific person"""
+        try:
+            if content_type == "movie":
+                url = f"https://api.themoviedb.org/3/person/{person_id}/movie_credits"
+            else:
+                url = f"https://api.themoviedb.org/3/person/{person_id}/tv_credits"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if content_type == "movie":
+                    results = data.get("cast", []) + data.get("crew", [])
+                else:
+                    results = data.get("cast", []) + data.get("crew", [])
+                
+                # Sort by popularity and rating
+                results.sort(key=lambda x: (x.get('popularity', 0), x.get('vote_average', 0)), reverse=True)
+                return results[:limit]
+            return []
+                
+        except Exception as e:
+            logging.error(f"Error getting content by person: {str(e)}")
+            return []
+
+    def get_trending_in_genres(self, genre_ids, content_type="movie", limit=10):
+        """Get trending content in specific genres as backup"""
+        try:
+            if not genre_ids:
+                return []
+                
+            if content_type == "movie":
+                url = "https://api.themoviedb.org/3/trending/movie/week"
+            else:
+                url = "https://api.themoviedb.org/3/trending/tv/week"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get("results", [])
+                
+                # Filter by matching genres
+                filtered_results = []
+                for item in results:
+                    item_genres = item.get('genre_ids', [])
+                    if any(genre in genre_ids for genre in item_genres):
+                        filtered_results.append(item)
+                
+                return filtered_results[:limit]
+            return []
+                
+        except Exception as e:
+            logging.error(f"Error getting trending in genres: {str(e)}")
+            return []
+
+    def calculate_recommendation_score(self, item, original_content, source_type):
+        """Calculate a score for how good a recommendation is"""
+        score = 0
+        
+        # Base score by source type
+        source_weights = {
+            'tmdb_similar': 100,      # Highest weight for TMDB similar
+            'genre_based': 80,        # High weight for genre matches
+            'cast_based': 70,         # Good weight for cast matches  
+            'trending': 50            # Lower weight for trending
+        }
+        score += source_weights.get(source_type, 50)
+        
+        # Bonus for higher ratings
+        vote_average = item.get('vote_average', 0)
+        score += vote_average * 10  # 0-100 bonus based on rating
+        
+        # Bonus for more votes (indicates popularity)
+        vote_count = item.get('vote_count', 0)
+        if vote_count > 1000:
+            score += 20
+        elif vote_count > 500:
+            score += 10
+        elif vote_count > 100:
+            score += 5
+        
+        # Bonus for genre overlap
+        original_genres = set(original_content.get('genre_ids', []))
+        item_genres = set(item.get('genre_ids', []))
+        genre_overlap = len(original_genres.intersection(item_genres))
+        score += genre_overlap * 15  # 15 points per matching genre
+        
+        # Slight penalty for very old content (unless it's a classic)
+        current_year = 2025
+        if 'release_date' in item:
+            release_year = int(item['release_date'][:4]) if item['release_date'] else current_year
+        elif 'first_air_date' in item:
+            release_year = int(item['first_air_date'][:4]) if item['first_air_date'] else current_year
+        else:
+            release_year = current_year
+        
+        age = current_year - release_year
+        if age > 20 and vote_average < 7.5:  # Penalize old content unless it's highly rated
+            score -= age * 0.5
+        
+        return score
+
+    def is_duplicate_recommendation(self, item, existing_recommendations):
+        """Check if this item is already in recommendations"""
+        item_id = item.get('id')
+        for existing_item, _, _ in existing_recommendations:
+            if existing_item.get('id') == item_id:
+                return True
+        return False
+
+    def ensure_recommendation_diversity(self, recommendations, limit):
+        """Ensure diversity in recommendations to avoid repetitive suggestions"""
+        if not recommendations:
+            return []
+        
+        diverse_recs = []
+        genre_counts = {}
+        year_counts = {}
+        
+        for item, score, source in recommendations:
+            if len(diverse_recs) >= limit:
+                break
+                
+            # Get item genres and year
+            item_genres = item.get('genre_ids', [])
+            if 'release_date' in item and item['release_date']:
+                item_year = item['release_date'][:4]
+            elif 'first_air_date' in item and item['first_air_date']:
+                item_year = item['first_air_date'][:4]
+            else:
+                item_year = "unknown"
+            
+            # Check if we have too many from same genre or year
+            dominant_genre = item_genres[0] if item_genres else None
+            
+            genre_limit = max(1, limit // 3)  # At most 1/3 from same genre
+            year_limit = max(1, limit // 4)   # At most 1/4 from same year
+            
+            genre_ok = not dominant_genre or genre_counts.get(dominant_genre, 0) < genre_limit
+            year_ok = year_counts.get(item_year, 0) < year_limit
+            
+            if genre_ok and year_ok:
+                diverse_recs.append((item, score, source))
+                
+                # Update counts
+                if dominant_genre:
+                    genre_counts[dominant_genre] = genre_counts.get(dominant_genre, 0) + 1
+                year_counts[item_year] = year_counts.get(item_year, 0) + 1
+        
+        # If we don't have enough diverse recommendations, fill with remaining high-scored ones
+        if len(diverse_recs) < limit:
+            for item, score, source in recommendations:
+                if len(diverse_recs) >= limit:
+                    break
+                if not self.is_in_diverse_recs(item, diverse_recs):
+                    diverse_recs.append((item, score, source))
+        
+        return diverse_recs
+
+    def is_in_diverse_recs(self, item, diverse_recs):
+        """Check if item is already in diverse recommendations"""
+        item_id = item.get('id')
+        for existing_item, _, _ in diverse_recs:
+            if existing_item.get('id') == item_id:
+                return True
+        return False
+    
+    def get_cast_info(self, content_id, content_type="movie", limit=8):
+        """Get cast information for movies or TV series using TMDB API"""
+        try:
+            if content_type == "movie":
+                url = f"https://api.themoviedb.org/3/movie/{content_id}/credits"
+            else:
+                url = f"https://api.themoviedb.org/3/tv/{content_id}/credits"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                cast = data.get("cast", [])
+                # Return top cast members with profile photos
+                return [actor for actor in cast[:limit] if actor.get("profile_path")]
+            else:
+                logging.warning(f"TMDB API returned status {response.status_code} for cast")
+                return []
+                
+        except (requests.ConnectionError, requests.Timeout):
+            logging.warning("No internet connection for cast info")
+            return []
+        except Exception as e:
+            logging.error(f"Error getting cast info: {str(e)}")
+            return []
+    
+    def get_actor_movies(self, actor_id, limit=12):
+        """Get movies that an actor has appeared in"""
+        try:
+            url = f"https://api.themoviedb.org/3/person/{actor_id}/movie_credits"
+            
+            response = requests.get(url, params={
+                "api_key": TMDB_API_KEY
+            }, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                cast_movies = data.get("cast", [])
+                # Sort by popularity and release date, filter out movies without posters
+                movies = [movie for movie in cast_movies if movie.get("poster_path")]
+                movies = sorted(movies, key=lambda x: (x.get("popularity", 0), x.get("release_date", "")), reverse=True)
+                return movies[:limit]
+            else:
+                logging.warning(f"TMDB API returned status {response.status_code} for actor movies")
+                return []
+                
+        except (requests.ConnectionError, requests.Timeout):
+            logging.warning("No internet connection for actor movies")
+            return []
+        except Exception as e:
+            logging.error(f"Error getting actor movies: {str(e)}")
+            return []
+    
+    def create_cast_section(self, content_id, content_type="movie"):
+        """Create a horizontal scrollable cast section with circular actor photos"""
+        cast_info = self.get_cast_info(content_id, content_type, limit=8)
+        
+        if not cast_info:
+            return None
+        
+        # Container for the cast section
+        cast_container = QWidget()
+        cast_layout = QVBoxLayout(cast_container)
+        cast_layout.setContentsMargins(0, 15, 0, 15)
+        cast_layout.setSpacing(15)
+        
+        # Cast section title
+        cast_title = QLabel("Cast")
+        cast_title.setStyleSheet("""
+            font-size: 18px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            margin-bottom: 10px;
+        """)
+        cast_layout.addWidget(cast_title)
+        
+        # Horizontal scroll area for cast
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(False)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setFixedHeight(140)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+        """)
+        
+        # Container for cast members
+        cast_members_container = QWidget()
+        cast_members_layout = QHBoxLayout(cast_members_container)
+        cast_members_layout.setContentsMargins(0, 0, 0, 0)
+        cast_members_layout.setSpacing(15)
+        
+        # Create cast member widgets
+        for actor in cast_info:
+            actor_widget = self.create_actor_widget(actor)
+            cast_members_layout.addWidget(actor_widget)
+        
+        cast_members_layout.addStretch()
+        scroll_area.setWidget(cast_members_container)
+        cast_layout.addWidget(scroll_area)
+        
+        return cast_container
+    
+    def create_actor_widget(self, actor_data):
+        """Create a clickable circular actor widget"""
+        actor_widget = QWidget()
+        actor_widget.setFixedSize(90, 120)
+        actor_widget.setCursor(Qt.PointingHandCursor)
+        
+        layout = QVBoxLayout(actor_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        # Circular profile photo
+        profile_label = QLabel()
+        profile_label.setFixedSize(90, 90)
+        profile_label.setScaledContents(True)
+        profile_label.setAlignment(Qt.AlignCenter)
+        profile_label.setStyleSheet("""
+            QLabel {
+                background-color: #333;
+                border-radius: 45px;
+                border: 2px solid #555;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
+        
+        # Show placeholder immediately
+        profile_label.setText("👤")
+        profile_label.setStyleSheet("""
+            color: #666; 
+            font-size: 30px; 
+            background-color: #333;
+            border-radius: 45px;
+            border: 2px solid #555;
+        """)
+        
+        layout.addWidget(profile_label)
+        
+        # Actor name
+        name_text = actor_data.get("name", "Unknown Actor")
+        name_label = QLabel(name_text)
+        name_label.setStyleSheet("""
+            color: white;
+            font-size: 10px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+        """)
+        name_label.setAlignment(Qt.AlignCenter)
+        name_label.setWordWrap(True)
+        name_label.setMaximumHeight(22)
+        layout.addWidget(name_label)
+        
+        # Store actor data and add click handler
+        actor_widget.actor_data = actor_data
+        actor_widget.mousePressEvent = lambda event: self.show_actor_movies(actor_data)
+        
+        # Load profile image asynchronously
+        profile_path = actor_data.get("profile_path")
+        if profile_path:
+            QTimer.singleShot(50, lambda: self.load_actor_profile_async(profile_label, profile_path))
+        
+        return actor_widget
+    
+    def load_actor_profile_async(self, label, profile_path):
+        """Load actor profile image asynchronously and make it circular"""
+        try:
+            # Use higher resolution image for better quality
+            profile_url = f"https://image.tmdb.org/t/p/w500{profile_path}"
+            response = requests.get(profile_url, timeout=5)
+            response.raise_for_status()
+            
+            # Load image
+            pixmap = QPixmap()
+            pixmap.loadFromData(response.content)
+            
+            if not pixmap.isNull():
+                # Scale to fit while maintaining aspect ratio, then crop center
+                target_size = 90
+                
+                # Use higher resolution for smoother scaling
+                temp_size = target_size * 2  # 2x resolution for better quality
+                
+                # Scale to fill the target size (larger dimension will be cropped)
+                scale_factor = temp_size / min(pixmap.width(), pixmap.height())
+                scaled_pixmap = pixmap.scaled(
+                    int(pixmap.width() * scale_factor), 
+                    int(pixmap.height() * scale_factor), 
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                )
+                
+                # Create square crop from center
+                x_offset = (scaled_pixmap.width() - temp_size) // 2
+                y_offset = (scaled_pixmap.height() - temp_size) // 2
+                square_pixmap = scaled_pixmap.copy(x_offset, y_offset, temp_size, temp_size)
+                
+                # Create circular pixmap at high resolution
+                circular_pixmap = QPixmap(temp_size, temp_size)
+                circular_pixmap.fill(Qt.transparent)
+                
+                painter = QPainter(circular_pixmap)
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                
+                # Create circular path
+                path = QPainterPath()
+                path.addEllipse(0, 0, temp_size, temp_size)
+                painter.setClipPath(path)
+                
+                # Draw the square cropped image
+                painter.drawPixmap(0, 0, square_pixmap)
+                painter.end()
+                
+                # Scale down to final size for crisp display
+                final_pixmap = circular_pixmap.scaled(target_size, target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+                # Set the circular image
+                if label and not label.isHidden():
+                    label.setPixmap(final_pixmap)
+                    label.setStyleSheet("""
+                        QLabel {
+                            background-color: transparent;
+                            border-radius: 45px;
+                            border: 2px solid #555;
+                        }
+                        QLabel:hover {
+                            border: 2px solid #E50914;
+                        }
+                    """)
+            else:
+                self.on_actor_profile_failed(label)
+                
+        except (requests.ConnectionError, requests.Timeout):
+            self.on_actor_profile_offline(label)
+        except Exception as e:
+            logging.error(f"Error loading actor profile: {str(e)}")
+            self.on_actor_profile_failed(label)
+    
+    def on_actor_profile_failed(self, label):
+        """Handle failed actor profile loading"""
+        try:
+            if label and not label.isHidden():
+                label.setText("👤")
+                label.setStyleSheet("""
+                    color: #666; 
+                    font-size: 30px; 
+                    background-color: #333;
+                    border-radius: 45px;
+                    border: 2px solid #555;
+                """)
+        except Exception as e:
+            pass
+    
+    def on_actor_profile_offline(self, label):
+        """Handle offline actor profile loading"""
+        try:
+            if label and not label.isHidden():
+                label.setText("📡")
+                label.setStyleSheet("""
+                    color: #666; 
+                    font-size: 24px; 
+                    background-color: #333;
+                    border-radius: 45px;
+                    border: 2px solid #444;
+                """)
+        except Exception as e:
+            self.on_actor_profile_failed(label)
+    
+    def show_home_tab(self):
+        """Navigate to home tab and clear navigation stack"""
+        self.stacked_widget.setCurrentIndex(0)
+        self.previous_view_stack.clear()
+    
+    def show_movies_tab(self):
+        """Navigate to movies tab and clear navigation stack"""
+        self.stacked_widget.setCurrentIndex(1)
+        self.previous_view_stack.clear()
+    
+    def show_series_tab(self):
+        """Navigate to series tab and clear navigation stack"""
+        self.show_series_window()
+        self.previous_view_stack.clear()
+    
+    def navigate_back(self):
+        """Navigate back to the previous view in the stack"""
+        if len(self.previous_view_stack) > 1:
+            # Remove current view from stack
+            self.previous_view_stack.pop()
+            
+            # Get previous view
+            view_type, view_data = self.previous_view_stack[-1]
+            
+            # Navigate to the appropriate view
+            if view_type == "movie_details":
+                self.show_home_movie_details(view_data)
+            elif view_type == "series_details":
+                self.show_home_series_details(view_data)
+            else:
+                # Fallback to home if we can't determine the previous view
+                self.stacked_widget.setCurrentIndex(0)
+                self.previous_view_stack.clear()
+        else:
+            # No previous view, go to home
+            self.stacked_widget.setCurrentIndex(0)
+            self.previous_view_stack.clear()
+    
+    def show_actor_movies(self, actor_data):
+        """Show movies that the selected actor has appeared in"""
+        actor_name = actor_data.get("name", "Unknown Actor")
+        actor_id = actor_data.get("id")
+        
+        if not actor_id:
+            return
+        
+        # Add actor view to navigation stack
+        self.previous_view_stack.append(("actor_movies", actor_data))
+        
+        # Clear previous content
+        for i in reversed(range(self.home_details_layout.count())):
+            widget = self.home_details_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+
+        # Create scroll area for the entire content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+        """)
+        
+        # Container widget for all content
+        container = QWidget()
+        container.setStyleSheet("background-color: #141414;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(20, 15, 20, 20)
+        container_layout.setSpacing(20)
+
+        # Back button - now navigates to the previous view properly
+        back_button = QPushButton("← Back")
+        back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                max-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        back_button.clicked.connect(self.navigate_back)
+        container_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+
+        # Actor info section
+        actor_info_widget = QWidget()
+        actor_info_layout = QHBoxLayout(actor_info_widget)
+        actor_info_layout.setContentsMargins(0, 0, 0, 0)
+        actor_info_layout.setSpacing(20)
+        
+        # Actor profile photo (larger)
+        profile_label = QLabel()
+        profile_label.setFixedSize(120, 120)
+        profile_label.setScaledContents(True)
+        profile_label.setAlignment(Qt.AlignCenter)
+        profile_label.setStyleSheet("""
+            QLabel {
+                background-color: #333;
+                border-radius: 60px;
+                border: 3px solid #555;
+            }
+        """)
+        profile_label.setText("👤")
+        profile_label.setStyleSheet("""
+            color: #666; 
+            font-size: 40px; 
+            background-color: #333;
+            border-radius: 60px;
+            border: 3px solid #555;
+        """)
+        actor_info_layout.addWidget(profile_label)
+        
+        # Load actor profile
+        profile_path = actor_data.get("profile_path")
+        if profile_path:
+            QTimer.singleShot(50, lambda: self.load_large_actor_profile_async(profile_label, profile_path))
+        
+        # Actor details
+        actor_details_widget = QWidget()
+        actor_details_layout = QVBoxLayout(actor_details_widget)
+        actor_details_layout.setContentsMargins(0, 0, 0, 0)
+        actor_details_layout.setSpacing(10)
+        
+        # Actor name
+        name_label = QLabel(actor_name)
+        name_label.setStyleSheet("""
+            font-size: 28px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+        """)
+        actor_details_layout.addWidget(name_label)
+        
+        # Known for
+        if actor_data.get("known_for_department"):
+            known_for_label = QLabel(f"Known for: {actor_data['known_for_department']}")
+            known_for_label.setStyleSheet("""
+                font-size: 16px; 
+                color: #AAAAAA;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+            """)
+            actor_details_layout.addWidget(known_for_label)
+        
+        actor_details_layout.addStretch()
+        actor_info_layout.addWidget(actor_details_widget)
+        actor_info_layout.addStretch()
+        
+        container_layout.addWidget(actor_info_widget)
+        
+        # Movies section
+        movies_label = QLabel(f"Movies featuring {actor_name}")
+        movies_label.setStyleSheet("""
+            font-size: 22px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            margin-top: 20px;
+            margin-bottom: 15px;
+        """)
+        container_layout.addWidget(movies_label)
+        
+        # Get and display actor's movies
+        actor_movies = self.get_actor_movies(actor_id, limit=15)
+        
+        if actor_movies:
+            # Create horizontal scroll area for movies
+            movies_scroll_area = QScrollArea()
+            movies_scroll_area.setWidgetResizable(False)
+            movies_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            movies_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            movies_scroll_area.setFixedHeight(280)
+            movies_scroll_area.setStyleSheet("""
+                QScrollArea {
+                    border: none;
+                    background: transparent;
+                }
+            """)
+            
+            # Container for movies
+            movies_container = QWidget()
+            movies_layout = QHBoxLayout(movies_container)
+            movies_layout.setContentsMargins(0, 0, 0, 0)
+            movies_layout.setSpacing(15)
+            
+            # Create movie widgets
+            for movie in actor_movies:
+                movie_widget = self.create_actor_movie_item(movie)
+                movies_layout.addWidget(movie_widget)
+            
+            movies_layout.addStretch()
+            movies_scroll_area.setWidget(movies_container)
+            container_layout.addWidget(movies_scroll_area)
+        else:
+            no_movies_label = QLabel("No movies found for this actor")
+            no_movies_label.setStyleSheet("""
+                color: #666; 
+                font-size: 16px;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+                padding: 20px;
+            """)
+            no_movies_label.setAlignment(Qt.AlignCenter)
+            container_layout.addWidget(no_movies_label)
+        
+        container_layout.addStretch()
+        
+        # Set up scroll area and add to main layout
+        scroll_area.setWidget(container)
+        self.home_details_layout.addWidget(scroll_area)
+        self.stacked_widget.setCurrentIndex(5)
+    
+    def load_large_actor_profile_async(self, label, profile_path):
+        """Load larger actor profile image asynchronously and make it circular"""
+        try:
+            # Use higher resolution image for better quality
+            profile_url = f"https://image.tmdb.org/t/p/w500{profile_path}"
+            response = requests.get(profile_url, timeout=5)
+            response.raise_for_status()
+            
+            # Load image
+            pixmap = QPixmap()
+            pixmap.loadFromData(response.content)
+            
+            if not pixmap.isNull():
+                # Scale to fit while maintaining aspect ratio, then crop center
+                target_size = 120
+                
+                # Use higher resolution for smoother scaling
+                temp_size = target_size * 2  # 2x resolution for better quality
+                
+                # Scale to fill the target size (larger dimension will be cropped)
+                scale_factor = temp_size / min(pixmap.width(), pixmap.height())
+                scaled_pixmap = pixmap.scaled(
+                    int(pixmap.width() * scale_factor), 
+                    int(pixmap.height() * scale_factor), 
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                )
+                
+                # Create square crop from center
+                x_offset = (scaled_pixmap.width() - temp_size) // 2
+                y_offset = (scaled_pixmap.height() - temp_size) // 2
+                square_pixmap = scaled_pixmap.copy(x_offset, y_offset, temp_size, temp_size)
+                
+                # Create circular pixmap at high resolution
+                circular_pixmap = QPixmap(temp_size, temp_size)
+                circular_pixmap.fill(Qt.transparent)
+                
+                painter = QPainter(circular_pixmap)
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                
+                # Create circular path
+                path = QPainterPath()
+                path.addEllipse(0, 0, temp_size, temp_size)
+                painter.setClipPath(path)
+                
+                # Draw the square cropped image
+                painter.drawPixmap(0, 0, square_pixmap)
+                painter.end()
+                
+                # Scale down to final size for crisp display
+                final_pixmap = circular_pixmap.scaled(target_size, target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+                # Set the circular image
+                if label and not label.isHidden():
+                    label.setPixmap(final_pixmap)
+                    label.setStyleSheet("""
+                        QLabel {
+                            background-color: transparent;
+                            border-radius: 60px;
+                            border: 3px solid #555;
+                        }
+                    """)
+            else:
+                self.on_large_actor_profile_failed(label)
+                
+        except (requests.ConnectionError, requests.Timeout):
+            self.on_large_actor_profile_offline(label)
+        except Exception as e:
+            logging.error(f"Error loading large actor profile: {str(e)}")
+            self.on_large_actor_profile_failed(label)
+    
+    def on_large_actor_profile_failed(self, label):
+        """Handle failed large actor profile loading"""
+        try:
+            if label and not label.isHidden():
+                label.setText("👤")
+                label.setStyleSheet("""
+                    color: #666; 
+                    font-size: 40px; 
+                    background-color: #333;
+                    border-radius: 60px;
+                    border: 3px solid #555;
+                """)
+        except Exception as e:
+            pass
+    
+    def on_large_actor_profile_offline(self, label):
+        """Handle offline large actor profile loading"""
+        try:
+            if label and not label.isHidden():
+                label.setText("📡")
+                label.setStyleSheet("""
+                    color: #666; 
+                    font-size: 32px; 
+                    background-color: #333;
+                    border-radius: 60px;
+                    border: 3px solid #444;
+                """)
+        except Exception as e:
+            self.on_large_actor_profile_failed(label)
+    
+    def create_actor_movie_item(self, movie_data):
+        """Create a movie item widget for actor's filmography"""
+        movie_widget = QWidget()
+        movie_widget.setFixedSize(140, 250)
+        movie_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+                border-radius: 8px;
+            }
+            QWidget:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+        """)
+        movie_widget.setCursor(Qt.PointingHandCursor)
+        
+        layout = QVBoxLayout(movie_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        # Poster image
+        poster_label = QLabel()
+        poster_label.setFixedSize(140, 210)
+        poster_label.setScaledContents(True)
+        poster_label.setAlignment(Qt.AlignCenter)
+        poster_label.setStyleSheet("""
+            QLabel {
+                background-color: #222;
+                border-radius: 8px;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
+        
+        # Show placeholder immediately
+        poster_label.setText("🎬")
+        poster_label.setStyleSheet("""
+            color: #666; 
+            font-size: 24px; 
+            background-color: #333;
+            border-radius: 8px;
+            border: 1px solid #444;
+        """)
+        
+        layout.addWidget(poster_label)
+        
+        # Movie title
+        title_text = movie_data.get("title", "Unknown Movie")
+        title_label = QLabel(title_text)
+        title_label.setStyleSheet("""
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+            padding: 2px 4px;
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(32)
+        layout.addWidget(title_label)
+        
+        # Store movie data and add click handler
+        movie_widget.movie_data = movie_data
+        movie_widget.mousePressEvent = lambda event: self.show_home_movie_details(movie_data)
+        
+        # Load poster image asynchronously
+        poster_path = movie_data.get("poster_path")
+        if poster_path:
+            QTimer.singleShot(50, lambda: self.load_poster_async(poster_label, poster_path, "🎬"))
+        
+        return movie_widget
+    
+    def create_more_like_this_section(self, content_id, content_type="movie"):
+        """Create a horizontal scrollable 'More Like This' section"""
+        # Get similar content
+        similar_content = self.get_similar_content(content_id, content_type, limit=15)
+        
+        if not similar_content:
+            return None
+        
+        # Container for the section
+        section_container = QWidget()
+        section_layout = QVBoxLayout(section_container)
+        section_layout.setContentsMargins(0, 20, 0, 0)
+        section_layout.setSpacing(15)
+        
+        # Section title
+        title_label = QLabel("More Like This")
+        title_label.setStyleSheet("""
+            font-size: 22px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            margin-bottom: 10px;
+        """)
+        section_layout.addWidget(title_label)
+        
+        # Horizontal scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(False)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setFixedHeight(290)  # Increased from 250 to accommodate titles
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+        """)
+        
+        # Container for similar content items
+        content_container = QWidget()
+        content_layout = QHBoxLayout(content_container)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(15)
+        
+        # Create items for similar content
+        for item in similar_content:
+            if content_type == "movie":
+                item_widget = self.create_similar_movie_item(item)
+            else:
+                item_widget = self.create_similar_series_item(item)
+            
+            if item_widget:
+                content_layout.addWidget(item_widget)
+        
+        content_layout.addStretch()
+        scroll_area.setWidget(content_container)
+        section_layout.addWidget(scroll_area)
+        
+        return section_container
+    
+    def create_similar_movie_item(self, movie_data):
+        """Create a similar movie item widget"""
+        movie_widget = QWidget()
+        movie_widget.setFixedSize(140, 250)  # Increased height to accommodate title
+        movie_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+                border-radius: 8px;
+            }
+            QWidget:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+        """)
+        movie_widget.setCursor(Qt.PointingHandCursor)
+        
+        layout = QVBoxLayout(movie_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        # Poster image
+        poster_label = QLabel()
+        poster_label.setFixedSize(140, 210)
+        poster_label.setScaledContents(True)
+        poster_label.setAlignment(Qt.AlignCenter)
+        poster_label.setStyleSheet("""
+            QLabel {
+                background-color: #222;
+                border-radius: 8px;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
+        
+        # Load poster image
+        poster_path = movie_data.get("poster_path")
+        if poster_path:
+            try:
+                image_url = f"{TMDB_IMAGE_URL}{poster_path}"
+                response = requests.get(image_url, timeout=5)
+                if response.status_code == 200:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(response.content)
+                    poster_label.setPixmap(pixmap)
+                else:
+                    poster_label.setText("No Image")
+                    poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+            except (requests.ConnectionError, requests.Timeout):
+                poster_label.setText("📡\nNo Internet")
+                poster_label.setStyleSheet("color: #E50914; font-size: 10px; background-color: #333;")
+            except Exception as e:
+                poster_label.setText("❌\nError")
+                poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+        else:
+            poster_label.setText("🎬\nNo Image")
+            poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+        
+        layout.addWidget(poster_label)
+        
+        # Movie title
+        title_text = movie_data.get("title", "Unknown Movie")
+        title_label = QLabel(title_text)
+        title_label.setStyleSheet("""
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+            padding: 2px 4px;
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(32)  # Limit height to 2 lines
+        layout.addWidget(title_label)
+        
+        # Store movie data and add click handler
+        movie_widget.movie_data = movie_data
+        movie_widget.mousePressEvent = lambda event: self.show_home_movie_details(movie_data)
+        
+        return movie_widget
+    
+    def create_similar_series_item(self, series_data):
+        """Create a similar TV series item widget"""
+        series_widget = QWidget()
+        series_widget.setFixedSize(140, 250)  # Increased height to accommodate title
+        series_widget.setStyleSheet("""
+            QWidget {
+                background-color: transparent;
+                border-radius: 8px;
+            }
+            QWidget:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+        """)
+        series_widget.setCursor(Qt.PointingHandCursor)
+        
+        layout = QVBoxLayout(series_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        # Poster image
+        poster_label = QLabel()
+        poster_label.setFixedSize(140, 210)
+        poster_label.setScaledContents(True)
+        poster_label.setAlignment(Qt.AlignCenter)
+        poster_label.setStyleSheet("""
+            QLabel {
+                background-color: #222;
+                border-radius: 8px;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
+        
+        # Load poster image
+        poster_path = series_data.get("poster_path")
+        if poster_path:
+            try:
+                image_url = f"{TMDB_IMAGE_URL}{poster_path}"
+                response = requests.get(image_url, timeout=5)
+                if response.status_code == 200:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(response.content)
+                    poster_label.setPixmap(pixmap)
+                else:
+                    poster_label.setText("No Image")
+                    poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+            except (requests.ConnectionError, requests.Timeout):
+                poster_label.setText("📡\nNo Internet")
+                poster_label.setStyleSheet("color: #E50914; font-size: 10px; background-color: #333;")
+            except Exception as e:
+                poster_label.setText("❌\nError")
+                poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+        else:
+            poster_label.setText("📺\nNo Image")
+            poster_label.setStyleSheet("color: white; font-size: 12px; background-color: #333;")
+        
+        layout.addWidget(poster_label)
+        
+        # Series title
+        title_text = series_data.get("name", "Unknown Series")
+        title_label = QLabel(title_text)
+        title_label.setStyleSheet("""
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+            padding: 2px 4px;
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(32)  # Limit height to 2 lines
+        layout.addWidget(title_label)
+        
+        # Store series data and add click handler
+        series_widget.series_data = series_data
+        series_widget.mousePressEvent = lambda event: self.show_home_series_details(series_data)
+        
+        return series_widget
 
     def create_genre_row(self, genre_name, genre_id, content_type="movie"):
         """Create a horizontal scrollable row of movies or TV series for a specific genre"""
@@ -2073,7 +3460,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         scroll_area.setWidgetResizable(False)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setFixedHeight(240)
+        scroll_area.setFixedHeight(280)  # Increased from 240 to accommodate titles
         scroll_area.setStyleSheet("""
             QScrollArea {
                 border: none;
@@ -2244,60 +3631,172 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             
             all_series = []
             
-            # Fetch from 1 page initially for faster loading
-            for page in [current_page]:  # Start with just one page for speed
-                if genre_id == "trending":
-                    # For "Trending" section, use trending TV shows
-                    url = f"{TMDB_API_URL}/trending/tv/week"
-                    params = {"api_key": TMDB_API_KEY, "page": page}
-                else:
-                    # For specific genres, discover TV series with better popularity filters
-                    url = f"{TMDB_API_URL}/discover/tv"
-                    
-                    # Special handling for romance genre for better content
-                    if genre_id == 10749:  # Romance genre - special handling for shows like "Never Have I Ever"
-                        params = {
-                            "api_key": TMDB_API_KEY,
-                            "with_genres": genre_id,
-                            "sort_by": "popularity.desc",  # Sort by popularity to get trending romance shows
-                            "vote_average.gte": 5.5,       # Lower threshold for romance shows
-                            "vote_count.gte": 20,          # Lower vote count to include newer shows
-                            "first_air_date.gte": "2005-01-01",  # Include shows from 2005 onwards for variety
-                            "page": page,
-                            "with_original_language": "en"  # Focus on English shows for better variety
-                        }
-                    # Special handling for genres that need different criteria
-                    elif genre_id == 27:  # Horror genre
-                        params = {
-                            "api_key": TMDB_API_KEY,
-                            "with_genres": genre_id,
-                            "sort_by": "popularity.desc",  # Use popularity instead of vote count for horror
-                            "vote_average.gte": 5.0,       # Lower minimum rating for horror
-                            "vote_count.gte": 10,          # Lower vote requirement
-                            "first_air_date.gte": "2000-01-01",  # Longer time range
-                            "page": page
-                        }
-                    else:
-                        params = {
-                            "api_key": TMDB_API_KEY,
-                            "with_genres": genre_id,
-                            "sort_by": "vote_count.desc",  # Sort by most voted first
-                            "vote_average.gte": 6.5,       # Minimum rating of 6.5 for TV shows
-                            "vote_count.gte": 50,          # At least 50 votes
-                            "first_air_date.gte": "2010-01-01",  # Shows from 2010 onwards
-                            "page": page
-                        }
-                
-                response = requests.get(url, params=params, timeout=5)  # Reduced timeout from 10s to 5s
-                response.raise_for_status()
-                data = response.json()
-                
-                # Add series from this page
-                page_series = data.get("results", [])
-                all_series.extend(page_series)
+            # Fetch from multiple pages for Romance, Horror, and Music to get more options
+            pages_to_fetch = [current_page]
+            if genre_id in [10749, 27, 10402]:  # Romance, Horror, Music
+                pages_to_fetch = [current_page, current_page + 1] if current_page < 3 else [current_page, 1]
             
-            # Load up to 20 series initially for faster display
-            series = all_series[:20]  # Reduced from 40 to 20 for faster initial load
+            for page in pages_to_fetch:
+                try:
+                    if genre_id == "trending":
+                        # For "Trending" section, use trending TV shows
+                        url = f"{TMDB_API_URL}/trending/tv/week"
+                        params = {"api_key": TMDB_API_KEY, "page": page}
+                    else:
+                        # For specific genres, discover TV series with better popularity filters
+                        url = f"{TMDB_API_URL}/discover/tv"
+                        
+                        # Special handling for romance genre for better content
+                        if genre_id == 10749:  # Romance genre - enhanced for more options
+                            params = {
+                                "api_key": TMDB_API_KEY,
+                                "with_genres": genre_id,
+                                "sort_by": "popularity.desc",  # Sort by popularity to get trending romance shows
+                                "vote_average.gte": 4.0,       # Lower threshold to include more shows
+                                "vote_count.gte": 10,          # Lower vote count to include newer shows
+                                "first_air_date.gte": "2000-01-01",  # Include shows from 2000 onwards for variety
+                                "page": page,
+                                  "include_adult": "false",
+                                "region": "US",  # <-- Add this line
+                                "with_origin_country": "US",
+                                "with_original_language": "en"
+                            }
+                      # Special handling for horror genre for more options
+                        elif genre_id == 27:  # Horror genre - enhanced for more options
+                            params = {
+                                "api_key": TMDB_API_KEY,
+                                "with_genres": genre_id,
+                                "sort_by": "popularity.desc",  # Use popularity instead of vote count for horror
+                                "vote_average.gte": 4.5,       # Lower minimum rating for horror to get more shows
+                                "vote_count.gte": 5,           # Very low vote requirement to include new horror shows
+                                "first_air_date.gte": "1995-01-01",  # Much longer time range for horror
+                                "page": page,
+                                "include_adult": "false"
+                            }
+                        # Special handling for music genre for more options
+                        elif genre_id == 10402:  # Music genre - enhanced for more options
+                            params = {
+                                "api_key": TMDB_API_KEY,
+                                "with_genres": genre_id,
+                                "sort_by": "popularity.desc",  # Use popularity for music shows
+                                "vote_average.gte": 4.0,       # Lower minimum rating for music
+                                "vote_count.gte": 5,           # Very low vote requirement to include music shows
+                                "first_air_date.gte": "1990-01-01",  # Long time range for music shows
+                                "page": page,
+                                "include_adult": "false"
+                            }
+                        else:
+                            params = {
+                                "api_key": TMDB_API_KEY,
+                                "with_genres": genre_id,
+                                "sort_by": "vote_count.desc",  # Sort by most voted first
+                                "vote_average.gte": 6.5,       # Minimum rating of 6.5 for TV shows
+                                "vote_count.gte": 50,          # At least 50 votes
+                                "first_air_date.gte": "2010-01-01",  # Shows from 2010 onwards
+                                "page": page
+                            }
+                    
+                    response = requests.get(url, params=params, timeout=5)  # Reduced timeout from 10s to 5s
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Add series from this page
+                    page_series = data.get("results", [])
+                    all_series.extend(page_series)
+                    
+                except Exception as page_error:
+                    logging.warning(f"Error fetching page {page} for genre {genre_id}: {str(page_error)}")
+                    continue  # Try next page if this one fails
+            
+            # For Romance, Horror, and Music, try additional API calls to get even more content
+            if genre_id in [10749, 27, 10402] and len(all_series) < 15:
+                try:
+                    # Try alternative search methods for these genres
+                    if genre_id == 10749:  # Romance - also search by keywords
+                        alt_url = f"{TMDB_API_URL}/discover/tv"
+                        alt_params = {
+                            "api_key": TMDB_API_KEY,
+                            "with_keywords": "9840|12916|210024",  # Romance, Love, Relationship keywords
+                            "sort_by": "popularity.desc",
+                            "vote_average.gte": 3.5,
+                            "page": 1,  
+                            "with_origin_country": "US",            # <-- Add this
+                            "with_original_language": "en" 
+                        }
+                        alt_response = requests.get(alt_url, params=alt_params, timeout=3)
+                        if alt_response.status_code == 200:
+                            alt_series = alt_response.json().get("results", [])
+                            all_series.extend(alt_series[:10])  # Add up to 10 more
+                    
+                    elif genre_id == 27:  # Horror - also search by keywords
+                        alt_url = f"{TMDB_API_URL}/discover/tv"
+                        alt_params = {
+                            "api_key": TMDB_API_KEY,
+                            "with_keywords": "12377|14819|170362",  # Horror, Supernatural, Scary keywords
+                            "sort_by": "popularity.desc",
+                            "vote_average.gte": 3.0,
+                            "page": 1
+                        }
+                        alt_response = requests.get(alt_url, params=alt_params, timeout=3)
+                        if alt_response.status_code == 200:
+                            alt_series = alt_response.json().get("results", [])
+                            all_series.extend(alt_series[:10])  # Add up to 10 more
+                    
+                    elif genre_id == 10402:  # Music - also search by keywords
+                        alt_url = f"{TMDB_API_URL}/discover/tv"
+                        alt_params = {
+                            "api_key": TMDB_API_KEY,
+                            "with_keywords": "6054|9715|10349",  # Music, Musical, Performance keywords
+                            "sort_by": "popularity.desc",
+                            "vote_average.gte": 3.0,
+                            "page": 1
+                        }
+                        alt_response = requests.get(alt_url, params=alt_params, timeout=3)
+                        if alt_response.status_code == 200:
+                            alt_series = alt_response.json().get("results", [])
+                            all_series.extend(alt_series[:10])  # Add up to 10 more
+                except:
+                    pass  # Continue if alternative search fails
+            
+            # Remove duplicates while preserving order
+            seen_ids = set()
+            unique_series = []
+            for series in all_series:
+                if series.get('id') not in seen_ids:
+                    seen_ids.add(series.get('id'))
+                    unique_series.append(series)
+            
+            # For Romance, Horror, and Music, show up to 30 series, otherwise 20
+            max_series = 30 if genre_id in [10749, 27, 10402] else 20
+            series = unique_series[:max_series]
+            
+            # If no series found, try a more generic search as fallback
+            if not series:
+                try:
+                    # Fallback: try with more relaxed criteria
+                    fallback_url = f"{TMDB_API_URL}/discover/tv"
+                    fallback_params = {
+                        "api_key": TMDB_API_KEY,
+                        "sort_by": "popularity.desc",
+                        "vote_average.gte": 3.0,
+                        "page": 1,
+                        "include_adult": "false"
+                    }
+                    
+                    # If it's a genre search, still try to include the genre but with relaxed criteria
+                    if genre_id != "trending" and str(genre_id).isdigit():
+                        fallback_params["with_genres"] = genre_id
+                    
+                    fallback_response = requests.get(fallback_url, params=fallback_params, timeout=3)
+                    if fallback_response.status_code == 200:
+                        fallback_data = fallback_response.json()
+                        fallback_series = fallback_data.get("results", [])[:10]  # Get at least 10 shows
+                        series = fallback_series
+                        logging.info(f"Used fallback content for genre {genre_id}, found {len(series)} shows")
+                except Exception as fallback_error:
+                    logging.warning(f"Fallback search also failed for genre {genre_id}: {str(fallback_error)}")
+                    pass  # If fallback also fails, continue with empty series
+            
             for i, show in enumerate(series):
                 series_widget = self.create_home_series_item_fast(show)
                 layout.addWidget(series_widget)
@@ -2305,6 +3804,20 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 # Process events every 5 items to keep UI responsive
                 if i % 5 == 0:
                     QApplication.processEvents()
+            
+            # If still no series, show a placeholder
+            if not series:
+                placeholder = QLabel("No shows found")
+                placeholder.setStyleSheet("""
+                    color: #888; 
+                    font-size: 12px;
+                    padding: 15px;
+                    background-color: #2a2a2a;
+                    border-radius: 8px;
+                    min-width: 140px;
+                """)
+                placeholder.setAlignment(Qt.AlignCenter)
+                layout.addWidget(placeholder)
                 
         except requests.ConnectionError:
             logging.error("No internet connection for loading genre series")
@@ -2351,28 +3864,36 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def create_home_movie_item_fast(self, movie_data):
         """Create a clickable movie poster widget with faster loading"""
         movie_widget = QWidget()
-        movie_widget.setFixedSize(140, 210)
+        movie_widget.setFixedSize(140, 250)  # Increased height to accommodate title
         movie_widget.setStyleSheet("""
             QWidget {
-                background-color: #222;
+                background-color: transparent;
                 border-radius: 8px;
             }
             QWidget:hover {
-                background-color: #333;
-                border: 2px solid #E50914;
+                background-color: rgba(255, 255, 255, 0.1);
             }
         """)
         movie_widget.setCursor(Qt.PointingHandCursor)
         
         layout = QVBoxLayout(movie_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setSpacing(8)
         
         # Poster image with placeholder
         poster_label = QLabel()
         poster_label.setFixedSize(140, 210)
         poster_label.setScaledContents(True)
         poster_label.setAlignment(Qt.AlignCenter)
+        poster_label.setStyleSheet("""
+            QLabel {
+                background-color: #222;
+                border-radius: 8px;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
         
         # Show placeholder immediately
         poster_label.setText("🎬")
@@ -2385,6 +3906,22 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         
         layout.addWidget(poster_label)
+        
+        # Movie title
+        title_text = movie_data.get("title", "Unknown Movie")
+        title_label = QLabel(title_text)
+        title_label.setStyleSheet("""
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+            padding: 2px 4px;
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(32)  # Limit height to 2 lines
+        layout.addWidget(title_label)
         
         # Store movie data for click handling
         movie_widget.movie_data = movie_data
@@ -2400,28 +3937,36 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def create_home_series_item_fast(self, series_data):
         """Create a clickable TV series poster widget with faster loading"""
         series_widget = QWidget()
-        series_widget.setFixedSize(140, 210)
+        series_widget.setFixedSize(140, 250)  # Increased height to accommodate title
         series_widget.setStyleSheet("""
             QWidget {
-                background-color: #222;
+                background-color: transparent;
                 border-radius: 8px;
             }
             QWidget:hover {
-                background-color: #333;
-                border: 2px solid #E50914;
+                background-color: rgba(255, 255, 255, 0.1);
             }
         """)
         series_widget.setCursor(Qt.PointingHandCursor)
         
         layout = QVBoxLayout(series_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setSpacing(8)
         
         # Poster image with placeholder
         poster_label = QLabel()
         poster_label.setFixedSize(140, 210)
         poster_label.setScaledContents(True)
         poster_label.setAlignment(Qt.AlignCenter)
+        poster_label.setStyleSheet("""
+            QLabel {
+                background-color: #222;
+                border-radius: 8px;
+            }
+            QLabel:hover {
+                border: 2px solid #E50914;
+            }
+        """)
         
         # Show placeholder immediately
         poster_label.setText("📺")
@@ -2434,6 +3979,22 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         
         layout.addWidget(poster_label)
+        
+        # Series title
+        title_text = series_data.get("name", "Unknown Series")
+        title_label = QLabel(title_text)
+        title_label.setStyleSheet("""
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            background-color: transparent;
+            padding: 2px 4px;
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(32)  # Limit height to 2 lines
+        layout.addWidget(title_label)
         
         # Store series data for click handling
         series_widget.series_data = series_data
@@ -2583,11 +4144,35 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 
     def show_home_series_details(self, series_data):
         """Show detailed view for a discovered TV series with trailer option"""
+        # Track current series data for back navigation
+        self.current_series_data = series_data
+        self.previous_view_stack.append(("series_details", series_data))
+        
         # Clear previous content
         for i in reversed(range(self.home_details_layout.count())):
             widget = self.home_details_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
+
+        # Create scroll area for the entire content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+        """)
+        
+        # Container widget for all content
+        container = QWidget()
+        container.setStyleSheet("background-color: #141414;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(20, 15, 20, 20)
+        container_layout.setSpacing(20)
 
         # Back button
         back_button = QPushButton("Back to Home")
@@ -2605,8 +4190,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #F40612;
             }
         """)
-        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
-        self.home_details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+        back_button.clicked.connect(lambda: [self.stacked_widget.setCurrentIndex(0), self.previous_view_stack.clear()])
+        container_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
         # Banner with backdrop image (Netflix-style horizontal banner) - cached version
         backdrop_path = series_data.get("backdrop_path")
@@ -2626,7 +4211,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             """)
             banner_label.setAlignment(Qt.AlignCenter)
             banner_label.setText("🎬")  # Placeholder while loading
-            self.home_details_layout.addWidget(banner_label)
+            container_layout.addWidget(banner_label)
             
             # Load backdrop asynchronously with caching
             series_title = series_data.get("name", "")
@@ -2657,7 +4242,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             meta_parts.append(f"★ {rating:.1f}")
         
         metadata_label = QLabel(" • ".join(meta_parts))
-        metadata_label.setStyleSheet("font-size: 16px; color: #AAAAAA; margin-bottom: 20px;")
+        metadata_label.setStyleSheet("""
+            font-size: 16px; 
+            color: #AAAAAA; 
+            margin-bottom: 20px;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+        """)
         details_layout.addWidget(metadata_label)
 
         # Synopsis
@@ -2681,10 +4271,19 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 border: none;
                 padding: 10px;
                 font-size: 14px;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
         """)
-        synopsis_text.setFixedHeight(150)
+        synopsis_text.setMinimumHeight(100)
+        synopsis_text.setMaximumHeight(200)
         details_layout.addWidget(synopsis_text)
+
+        # Cast section
+        series_id = series_data.get("id")
+        if series_id:
+            cast_section = self.create_cast_section(series_id, "tv")
+            if cast_section:
+                details_layout.addWidget(cast_section)
 
         # Action buttons
         buttons_layout = QHBoxLayout()
@@ -2700,6 +4299,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 16px;
                 border-radius: 4px;
                 font-weight: bold;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
             QPushButton:hover {
                 background-color: #F40612;
@@ -2712,7 +4312,18 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         details_layout.addLayout(buttons_layout)
 
         details_layout.addStretch()
-        self.home_details_layout.addWidget(details_widget)
+        container_layout.addWidget(details_widget)
+        
+        # Add "More Like This" section
+        series_id = series_data.get("id")
+        if series_id:
+            more_like_this_section = self.create_more_like_this_section(series_id, "tv")
+            if more_like_this_section:
+                container_layout.addWidget(more_like_this_section)
+        
+        # Set up scroll area and add to main layout
+        scroll_area.setWidget(container)
+        self.home_details_layout.addWidget(scroll_area)
         self.stacked_widget.setCurrentIndex(5)
 
     def watch_series_trailer(self, series_data):
@@ -2805,11 +4416,35 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 
     def show_home_movie_details(self, movie_data):
         """Show detailed view for a discovered movie with trailer option"""
+        # Track current movie data for back navigation
+        self.current_movie_data = movie_data
+        self.previous_view_stack.append(("movie_details", movie_data))
+        
         # Clear previous content
         for i in reversed(range(self.home_details_layout.count())):
             widget = self.home_details_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
+
+        # Create scroll area for the entire content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+        """)
+        
+        # Container widget for all content
+        container = QWidget()
+        container.setStyleSheet("background-color: #141414;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(20, 15, 20, 20)
+        container_layout.setSpacing(20)
 
         # Back button
         back_button = QPushButton("Back to Home")
@@ -2827,8 +4462,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #F40612;
             }
         """)
-        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
-        self.home_details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+        back_button.clicked.connect(lambda: [self.stacked_widget.setCurrentIndex(0), self.previous_view_stack.clear()])
+        container_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
         # Banner with backdrop image (Netflix-style horizontal banner) - cached version
         backdrop_path = movie_data.get("backdrop_path")
@@ -2848,7 +4483,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             """)
             banner_label.setAlignment(Qt.AlignCenter)
             banner_label.setText("🎬")  # Placeholder while loading
-            self.home_details_layout.addWidget(banner_label)
+            container_layout.addWidget(banner_label)
             
             # Load backdrop asynchronously with caching
             movie_title = movie_data.get("title", "")
@@ -2884,7 +4519,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             meta_parts.append(f"{hours}h {minutes}m")
         
         metadata_label = QLabel(" • ".join(meta_parts))
-        metadata_label.setStyleSheet("font-size: 16px; color: #AAAAAA; margin-bottom: 20px;")
+        metadata_label.setStyleSheet("""
+            font-size: 16px; 
+            color: #AAAAAA; 
+            margin-bottom: 20px;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+        """)
         details_layout.addWidget(metadata_label)
 
         # Synopsis
@@ -2908,10 +4548,19 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 border: none;
                 padding: 10px;
                 font-size: 14px;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
         """)
-        synopsis_text.setFixedHeight(150)
+        synopsis_text.setMinimumHeight(100)
+        synopsis_text.setMaximumHeight(200)
         details_layout.addWidget(synopsis_text)
+
+        # Cast section
+        movie_id = movie_data.get("id")
+        if movie_id:
+            cast_section = self.create_cast_section(movie_id, "movie")
+            if cast_section:
+                details_layout.addWidget(cast_section)
 
         # Action buttons
         buttons_layout = QHBoxLayout()
@@ -2927,6 +4576,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 font-size: 16px;
                 border-radius: 4px;
                 font-weight: bold;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
             QPushButton:hover {
                 background-color: #F40612;
@@ -2939,7 +4589,18 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         details_layout.addLayout(buttons_layout)
 
         details_layout.addStretch()
-        self.home_details_layout.addWidget(details_widget)
+        container_layout.addWidget(details_widget)
+        
+        # Add "More Like This" section
+        movie_id = movie_data.get("id")
+        if movie_id:
+            more_like_this_section = self.create_more_like_this_section(movie_id, "movie")
+            if more_like_this_section:
+                container_layout.addWidget(more_like_this_section)
+        
+        # Set up scroll area and add to main layout
+        scroll_area.setWidget(container)
+        self.home_details_layout.addWidget(scroll_area)
         self.stacked_widget.setCurrentIndex(5)
 
     def watch_trailer(self, movie_data):
@@ -3365,8 +5026,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         painter.drawRect(65, 30, 20, 165)
         
         painter.setPen(QColor(255, 255, 255))
-        font = QFont('Netflix Sans', 10, QFont.Bold)
+        font = QFont('Netflix Sans Bold', 10, QFont.Bold)
+        font.setHintingPreference(QFont.PreferFullHinting)
+        font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
         painter.setFont(font)
+        # Enable text antialiasing for crisp rendering
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
         rect = pixmap.rect().adjusted(10, 180, -10, -10)
         painter.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, series_name)
         
@@ -4091,7 +5756,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         if getattr(item, "imdb_rating", None):
             meta_parts.append(f"IMDb: ★ {item.imdb_rating:.1f}")
         metadata_label = QLabel(" • ".join(meta_parts))
-        metadata_label.setStyleSheet("font-size: 16px; color: #AAAAAA; margin-bottom: 20px;")
+        metadata_label.setStyleSheet("""
+            font-size: 16px; 
+            color: #AAAAAA; 
+            margin-bottom: 20px;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+        """)
         details_layout.addWidget(metadata_label)
 
         synopsis_label = QLabel("Synopsis")
@@ -4114,6 +5784,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 border: none;
                 padding: 10px;
                 font-size: 14px;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
             }
         """)
         synopsis_text.setFixedHeight(150)
