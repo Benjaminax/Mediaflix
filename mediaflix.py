@@ -12,7 +12,36 @@ from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog,
                             QMessageBox, QStackedWidget, QScrollArea, QFrame, QDialog, QLineEdit,
-                            QSizePolicy, QSpacerItem, QTextEdit, QComboBox, QGroupBox, QGridLayout, QMenu)
+                            QSizePolicy, QSpacerItem, QTextEdit, QComboBox, QGroupBox, QGridLayout, QMenu,
+                            QRadioButton, QCheckBox, QProgressBar)
+
+# --- Global error handling and startup checks ---
+import traceback
+
+def show_critical_error(message, details=None):
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Critical)
+    msg.setWindowTitle("Mediaflix - Error")
+    msg.setText(message)
+    if details:
+        msg.setDetailedText(details)
+    msg.exec_()
+
+def check_tmdb_api_key():
+    global TMDB_API_KEY
+    if 'TMDB_API_KEY' not in globals() or not TMDB_API_KEY or TMDB_API_KEY.strip() == "":
+        show_critical_error(
+            "TMDB API Key is missing!\nPlease set the TMDB_API_KEY in your environment or configuration.",
+            "The application cannot run without a valid TMDB API Key."
+        )
+        sys.exit(1)
+
+def excepthook(type, value, tb):
+    tb_str = ''.join(traceback.format_exception(type, value, tb))
+    show_critical_error("A fatal error occurred and the app must close.", tb_str)
+    sys.exit(1)
+
+sys.excepthook = excepthook
 from PyQt5.QtCore import Qt, QSize, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QPainter, QFontDatabase, QLinearGradient, QPainterPath
 import subprocess
@@ -717,6 +746,210 @@ class BackdropCachePreloader(QThread):
         return False
 
 class MediaOrganizerApp(QMainWindow):
+
+    def show_episode_details(self, episode_item, parent_series_path=None):
+        # Show details for a single episode file
+        for i in reversed(range(self.details_layout.count())):
+            widget = self.details_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+
+        back_button = QPushButton("Back")
+        back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                max-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        if parent_series_path:
+            back_button.clicked.connect(lambda: self.show_series_episodes(self._make_series_item(parent_series_path)))
+        else:
+            back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
+        self.details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+
+        # --- Caching logic for episode synopsis and backdrop ---
+        import os
+        from urllib.parse import quote
+        # Determine series name
+        series_name = None
+        if parent_series_path:
+            series_name = os.path.basename(parent_series_path)
+        else:
+            if hasattr(episode_item, 'text'):
+                ep_path = episode_item.text()
+                if os.path.sep in ep_path:
+                    series_name = os.path.basename(os.path.dirname(os.path.dirname(ep_path)))
+        filename = episode_item.text()
+        season_episode = self.extract_season_episode(filename)
+        season_num, episode_num = (season_episode if season_episode else (1, 1))
+        cache_base = f"{series_name}_S{season_num:02d}E{episode_num:02d}"
+        cache_synopsis_file = os.path.join(SYNOPSIS_CACHE_DIR, f"{quote(cache_base)}_ep.txt")
+        cache_backdrop_file = os.path.join(BACKDROP_CACHE_DIR, f"{quote(cache_base)}_ep.jpg")
+
+        # Try to load cached synopsis and backdrop first
+        episode_synopsis = None
+        episode_title = filename
+        backdrop_pixmap = None
+        if os.path.exists(cache_synopsis_file):
+            try:
+                with open(cache_synopsis_file, 'r', encoding='utf-8') as f:
+                    episode_synopsis = f.read().strip()
+            except Exception:
+                episode_synopsis = None
+        if os.path.exists(cache_backdrop_file):
+            try:
+                pixmap = QPixmap(cache_backdrop_file)
+                if not pixmap.isNull():
+                    backdrop_pixmap = pixmap
+            except Exception:
+                backdrop_pixmap = None
+
+        fetched_online = False
+        # If not cached, fetch from TMDB
+        if episode_synopsis is None or backdrop_pixmap is None:
+            try:
+                import requests
+                import re
+                TMDB_API_KEY = globals().get('TMDB_API_KEY', None)
+                TMDB_API_URL = globals().get('TMDB_API_URL', 'https://api.themoviedb.org/3')
+                if TMDB_API_KEY and series_name:
+                    params = {"api_key": TMDB_API_KEY, "query": series_name}
+                    search_url = f"{TMDB_API_URL}/search/tv"
+                    resp = requests.get(search_url, params=params, timeout=5)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    best_match = None
+                    best_score = -1
+                    for result in data.get("results", []):
+                        title = result.get("name", "")
+                        score = 0
+                        if title.lower() == series_name.lower():
+                            score += 10
+                        if re.sub(r'[^\w]', '', title.lower()) == re.sub(r'[^\w]', '', series_name.lower()):
+                            score += 5
+                        if score > best_score:
+                            best_score = score
+                            best_match = result
+                    if best_match:
+                        tmdb_id = best_match.get("id")
+                        if tmdb_id:
+                            ep_url = f"{TMDB_API_URL}/tv/{tmdb_id}/season/{season_num}/episode/{episode_num}"
+                            ep_params = {"api_key": TMDB_API_KEY}
+                            ep_resp = requests.get(ep_url, params=ep_params, timeout=5)
+                            if ep_resp.status_code == 200:
+                                ep_data = ep_resp.json()
+                                episode_synopsis = ep_data.get("overview") or episode_synopsis
+                                episode_title = ep_data.get("name") or episode_title
+                                # Save synopsis to cache
+                                if episode_synopsis:
+                                    try:
+                                        os.makedirs(SYNOPSIS_CACHE_DIR, exist_ok=True)
+                                        with open(cache_synopsis_file, 'w', encoding='utf-8') as f:
+                                            f.write(episode_synopsis)
+                                    except Exception:
+                                        pass
+                                # Download and cache backdrop if available
+                                still_path = ep_data.get("still_path")
+                                if still_path:
+                                    try:
+                                        TMDB_BACKDROP_URL = globals().get('TMDB_BACKDROP_URL', 'https://image.tmdb.org/t/p/original')
+                                        img_url = f"{TMDB_BACKDROP_URL}{still_path}"
+                                        img_resp = requests.get(img_url, timeout=10)
+                                        if img_resp.status_code == 200:
+                                            from PIL import Image
+                                            from io import BytesIO
+                                            img = Image.open(BytesIO(img_resp.content))
+                                            os.makedirs(BACKDROP_CACHE_DIR, exist_ok=True)
+                                            img.save(cache_backdrop_file, format='JPEG')
+                                            pixmap = QPixmap(cache_backdrop_file)
+                                            if not pixmap.isNull():
+                                                backdrop_pixmap = pixmap
+                                    except Exception:
+                                        pass
+                                fetched_online = True
+            except Exception as e:
+                import logging
+                logging.error(f"Error fetching episode synopsis/backdrop from TMDB: {str(e)}")
+
+        # Banner: show episode backdrop if available, else placeholder
+        banner_label = QLabel()
+        banner_label.setFixedHeight(380)
+        banner_label.setMinimumHeight(300)
+        banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        banner_label.setAlignment(Qt.AlignCenter)
+        if backdrop_pixmap:
+            # Use the same create_poster_banner logic as movies for gradient overlay and scaling
+            banner_label.original_pixmap = backdrop_pixmap
+            banner = self.create_poster_banner(backdrop_pixmap, width=self.details_view.width() or 900, height=380)
+            banner_label.setPixmap(banner)
+            # Attach resize event for responsive resizing
+            def resize_banner_event(event, label=banner_label):
+                self.resize_banner(label, event)
+            banner_label.resizeEvent = resize_banner_event
+        else:
+            banner_label.setText("📺")
+            banner_label.setStyleSheet("font-size: 64px; color: #888; background: #222; border-radius: 8px;")
+        self.details_layout.addWidget(banner_label)
+
+        details_widget = QWidget()
+        details_layout = QVBoxLayout(details_widget)
+
+        # If still no synopsis, fallback
+        if not episode_synopsis:
+            episode_synopsis = "Synopsis not available"
+
+        # Title
+        title_label = QLabel(episode_title)
+        title_label.setStyleSheet("font-size: 22px; font-weight: bold; color: white; margin-bottom: 10px;")
+        details_layout.addWidget(title_label)
+
+        # Metadata (season/episode number)
+        meta_label = QLabel(f"Season {season_num}, Episode {episode_num}")
+        meta_label.setStyleSheet("font-size: 14px; color: #AAAAAA; margin-bottom: 10px;")
+        details_layout.addWidget(meta_label)
+
+        # Synopsis
+        synopsis_label = QLabel("Synopsis")
+        synopsis_label.setStyleSheet("font-size: 16px; font-weight: bold; color: white; margin-bottom: 5px;")
+        details_layout.addWidget(synopsis_label)
+        synopsis_text = QTextEdit()
+        synopsis_text.setPlainText(episode_synopsis)
+        synopsis_text.setReadOnly(True)
+        synopsis_text.setStyleSheet("background: transparent; color: white; border: none; font-size: 13px;")
+        synopsis_text.setFixedHeight(100)
+        details_layout.addWidget(synopsis_text)
+
+        # Play button
+        play_button = QPushButton("Play")
+        play_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                font-size: 16px;
+                border-radius: 4px;
+                margin-top: 20px;
+                max-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        play_button.clicked.connect(lambda: self.play_media(episode_item))
+        details_layout.addWidget(play_button)
+
+        details_layout.addStretch()
+        self.details_layout.addWidget(details_widget)
+        self.stacked_widget.setCurrentIndex(4)
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Mediiaflix")
@@ -756,9 +989,9 @@ class MediaOrganizerApp(QMainWindow):
         self.backdrop_preloader.progress_updated.connect(self.on_cache_progress_updated)
         self.backdrop_preloader.cache_completed.connect(self.on_cache_completed)
         
-        self.load_custom_fonts()
+        # self.load_custom_fonts()  # Disabled for EXE stability
         self.set_dark_theme()
-        self.optimize_font_rendering()
+        # self.optimize_font_rendering()  # Disabled for EXE stability
         
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
@@ -809,42 +1042,8 @@ class MediaOrganizerApp(QMainWindow):
                     QTimer.singleShot(10, lambda w=widget: self.resize_banner(w, None))
     
     def load_custom_fonts(self):
-        font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
-        if os.path.exists(font_dir):
-            # Load custom Netflix Sans fonts
-            bold_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Bold.otf"))
-            medium_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Medium.otf"))
-            regular_id = QFontDatabase.addApplicationFont(os.path.join(font_dir, "NetflixSans-Regular.otf"))
-            
-            # Verify fonts were loaded successfully
-            if bold_id != -1:
-                families = QFontDatabase.applicationFontFamilies(bold_id)
-                if families:
-                    print(f"Successfully loaded Netflix Sans Bold: {families[0]}")
-            
-            if medium_id != -1:
-                families = QFontDatabase.applicationFontFamilies(medium_id)
-                if families:
-                    print(f"Successfully loaded Netflix Sans Medium: {families[0]}")
-                    
-            if regular_id != -1:
-                families = QFontDatabase.applicationFontFamilies(regular_id)
-                if families:
-                    print(f"Successfully loaded Netflix Sans Regular: {families[0]}")
-        
-        # Set application-wide font rendering settings for crisp text
-        from PyQt5.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app:
-            # Enable font smoothing and high DPI support
-            app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-            app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-            
-            # Set default application font with proper hinting
-            default_font = QFont("Netflix Sans Medium", 10)
-            default_font.setHintingPreference(QFont.PreferFullHinting)
-            default_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-            app.setFont(default_font)
+        # Disabled custom font loading for EXE stability
+        pass
 
     def set_dark_theme(self):
         dark_palette = QPalette()
@@ -969,37 +1168,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         return font
 
     def optimize_font_rendering(self):
-        """Optimize font rendering for the entire application"""
-        from PyQt5.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app:
-            # Enable font smoothing and better quality rendering
-            app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-            
-            # Set the default font for the entire application
-            try:
-                app_font = self.create_crisp_font("Netflix Sans Medium", 11, QFont.Normal)
-                if app_font:
-                    app.setFont(app_font)
-            except Exception as e:
-                print(f"Could not set application font: {e}")
-                # Fallback to system font with optimizations
-                fallback_font = QFont("Segoe UI", 11)
-                fallback_font.setHintingPreference(QFont.PreferFullHinting)
-                fallback_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-                app.setFont(fallback_font)
-            
-            # Enable font antialiasing globally if possible
-            try:
-                import sys
-                if sys.platform == "win32":
-                    # Windows-specific font smoothing
-                    import ctypes
-                    from ctypes import wintypes
-                    # Enable ClearType
-                    ctypes.windll.gdi32.SystemParametersInfoW(0x1015, 0, True, 0)
-            except Exception:
-                pass  # Ignore errors if platform-specific optimizations fail
+        # Disabled font rendering optimization for EXE stability
+        pass
 
     def create_netflix_icon(self):
         pixmap = QPixmap(64, 64)
@@ -1029,12 +1199,38 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         return pixmap
 
     def extract_movie_title(self, name):
-        """Extract movie title by removing file extensions and year"""
-        clean = name.replace('.', ' ').replace('_', ' ')
-        match = re.search(r'(19|20)\d{2}', clean)
-        if match:
-            return clean[:match.start()].strip()
-        return clean.strip()
+        """Extract movie title by removing file extensions, year, and quality indicators"""
+        # Remove file extension
+        clean = os.path.splitext(name)[0]
+        
+        # Replace dots and underscores with spaces
+        clean = clean.replace('.', ' ').replace('_', ' ')
+        
+        # Remove common quality indicators
+        quality_patterns = [
+            r'\b(1080p?|720p?|480p?|2160p?|4K|UHD|HD|SD)\b',
+            r'\b(x264|x265|h264|h265|HEVC|AVC)\b',
+            r'\b(BluRay|BRRip|DVDRip|WEBRip|WEB-DL|HDTV|CAM|TS)\b',
+            r'\b(AAC|AC3|DTS|MP3)\b',
+            r'\[(.*?)\]',  # Remove content in square brackets
+            r'\((.*?)\)',  # Remove content in parentheses (but keep years)
+        ]
+        
+        for pattern in quality_patterns[:-1]:  # Skip parentheses pattern for now
+            clean = re.sub(pattern, '', clean, flags=re.IGNORECASE)
+        
+        # Remove release group tags (usually at the end after a dash)
+        clean = re.sub(r'-[A-Za-z0-9]+$', '', clean)
+        
+        # Remove year (but keep track of it)
+        year_match = re.search(r'\b(19|20)\d{2}\b', clean)
+        if year_match:
+            clean = clean[:year_match.start()].strip()
+        
+        # Clean up extra spaces
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        
+        return clean
 
     def resize_banner(self, banner_label, event):
         """Dynamically resize banner with gradient overlay to match window width"""
@@ -1518,7 +1714,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.main_layout.addWidget(self.content_area, 1)
 
     def create_home_view(self):
-        """Create the Netflix-style home discovery view with movies by genre"""
+        """Create the Netflix-style home discovery view with movies by genre and search bar"""
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet("""
@@ -1537,6 +1733,41 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         layout.setContentsMargins(20, 15, 20, 20)
         layout.setSpacing(30)
         
+        # Search Bar Container (curved corners)
+        search_container = QWidget()
+        search_container.setFixedHeight(60)
+        search_layout = QHBoxLayout(search_container)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(0)
+
+        # Search Input Field - More rounded corners
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search movies, TV shows...")
+        self.search_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #2D2D2D;
+                color: white;
+                border: 2px solid #444;
+                border-radius: 25px;
+                padding: 12px 32px;
+                font-size: 16px;
+                font-family: 'Netflix Sans Medium', 'Segoe UI', 'Arial', sans-serif;
+                min-width: 700px;
+                max-width: 1200px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #E50914;
+            }
+        """)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.handle_search_input_changed)
+        self.search_input.returnPressed.connect(self.perform_search)
+
+        search_layout.addWidget(self.search_input)
+        search_layout.setAlignment(self.search_input, Qt.AlignHCenter)
+        self.search_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(search_container)
+        
         # Title
         title_container = QWidget()
         title_container.setFixedHeight(60)
@@ -1551,7 +1782,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
             letter-spacing: -0.5px;
         """)
-        # Apply crisp font rendering
         title_font = self.create_crisp_font("Netflix Sans Bold", 28, bold=True)
         title_label.setFont(title_font)
         title_layout.addWidget(title_label)
@@ -1644,11 +1874,11 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         filter_layout.addStretch()
         
         # Add reload button on the far right
-        self.reload_home_btn = QPushButton("⟳")  # Standard refresh symbol
+        self.reload_home_btn = QPushButton("⟳")
         self.reload_home_btn.setFixedHeight(45)
-        self.reload_home_btn.setFixedWidth(45)  # Square button for icon
+        self.reload_home_btn.setFixedWidth(45)
         self.reload_home_btn.clicked.connect(self.reload_home_content)
-        self.reload_home_btn.setToolTip("Refresh content")  # Tooltip for clarity
+        self.reload_home_btn.setToolTip("Refresh content")
         self.reload_home_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2D2D2D;
@@ -1668,7 +1898,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #B00710;
             }
         """)
-        # Apply crisp font to reload button
         reload_font = self.create_crisp_font("Netflix Sans Medium", 18)
         self.reload_home_btn.setFont(reload_font)
         
@@ -1690,10 +1919,162 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         
         scroll_area.setWidget(container)
         
-        # Load content asynchronously immediately - faster initial load
-        QTimer.singleShot(10, self.load_home_content_async)  # Reduced from 50ms to 10ms
+        # Load content asynchronously immediately
+        QTimer.singleShot(10, self.load_home_content_async)
         
         return scroll_area
+
+    def handle_search_input_changed(self, text):
+        """Handle changes in the search input field"""
+        # When search is cleared, return to current content filter
+        if not text.strip():
+            self.current_content_filter = "movie" if self.movies_filter_btn.isChecked() else "tv"
+            self.load_home_content_async()
+            return
+        # Use a timer to debounce the search
+        if hasattr(self, 'search_timer'):
+            self.search_timer.stop()
+        self.search_timer = QTimer()
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(lambda: self.perform_search(text))
+        self.search_timer.start(500)  # Wait 500ms after last keystroke
+
+    def perform_search(self, query=None):
+        """Perform search based on the search input"""
+        if query is None:
+            query = self.search_input.text().strip()
+        if not query:
+            # If empty query, show normal home content
+            self.current_content_filter = "movie" if self.movies_filter_btn.isChecked() else "tv"
+            self.load_home_content_async()
+            return
+        # Clear current content
+        for i in reversed(range(self.home_content_layout.count())):
+            widget = self.home_content_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+        # Show loading state
+        loading_widget = QWidget()
+        loading_layout = QVBoxLayout(loading_widget)
+        loading_layout.setContentsMargins(50, 50, 50, 50)
+        loading_layout.setSpacing(20)
+        loading_label = QLabel("🔍 Searching...")
+        loading_label.setStyleSheet("""
+            font-size: 24px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+        """)
+        loading_label.setAlignment(Qt.AlignCenter)
+        loading_layout.addWidget(loading_label)
+        self.home_content_layout.addWidget(loading_widget)
+        # Perform search asynchronously
+        QTimer.singleShot(50, lambda: self.execute_search(query))
+
+    def execute_search(self, query):
+        """Execute the search with the given query"""
+        try:
+            # Clear loading widget
+            for i in reversed(range(self.home_content_layout.count())):
+                widget = self.home_content_layout.itemAt(i).widget()
+                if widget:
+                    widget.setParent(None)
+            # Determine content type based on current filter
+            content_type = "movie" if self.movies_filter_btn.isChecked() else "tv"
+            # Search based on current filter
+            params = {
+                "api_key": TMDB_API_KEY,
+                "query": query,
+                "page": 1,
+                "include_adult": "false"
+            }
+            if content_type == "movie":
+                url = f"{TMDB_API_URL}/search/movie"
+                title = f"Movies matching '{query}'"
+            else:
+                url = f"{TMDB_API_URL}/search/tv"
+                title = f"TV Shows matching '{query}'"
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json().get("results", [])[:15]  # Limit to 15 results
+            # Create results container
+            results_container = QWidget()
+            results_layout = QVBoxLayout(results_container)
+            results_layout.setContentsMargins(0, 0, 0, 0)
+            results_layout.setSpacing(30)
+            # Add results if found
+            if data:
+                results_label = QLabel(title)
+                results_label.setStyleSheet("""
+                    font-size: 22px; 
+                    font-weight: bold; 
+                    color: white;
+                    font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+                """)
+                results_layout.addWidget(results_label)
+                # Horizontal scroll area for results
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(False)
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll.setFixedHeight(280)
+                scroll.setStyleSheet("""
+                    QScrollArea {
+                        border: none;
+                        background: transparent;
+                    }
+                """)
+                container = QWidget()
+                layout = QHBoxLayout(container)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(15)
+                for item in data:
+                    if content_type == "movie":
+                        widget = self.create_home_movie_item_fast(item)
+                    else:
+                        widget = self.create_home_series_item_fast(item)
+                    layout.addWidget(widget)
+                layout.addStretch()
+                scroll.setWidget(container)
+                results_layout.addWidget(scroll)
+            # If no results found
+            if not data:
+                no_results = QLabel(f"No {content_type} results found for '{query}'")
+                no_results.setStyleSheet("""
+                    font-size: 18px; 
+                    color: #AAAAAA;
+                    font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+                    padding: 40px;
+                """)
+                no_results.setAlignment(Qt.AlignCenter)
+                results_layout.addWidget(no_results)
+            results_layout.addStretch()
+            self.home_content_layout.addWidget(results_container)
+        except Exception as e:
+            error_label = QLabel("Error performing search")
+            error_label.setStyleSheet("""
+                font-size: 18px; 
+                color: #E50914;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+                padding: 40px;
+            """)
+            error_label.setAlignment(Qt.AlignCenter)
+            self.home_content_layout.addWidget(error_label)
+            logging.error(f"Search error: {str(e)}")
+
+    def filter_home_content(self, filter_type):
+        """Filter home content by type (movie, tv) - optimized for speed"""
+        # Update button states - only one can be active at a time
+        self.movies_filter_btn.setChecked(filter_type == "movie")
+        self.series_filter_btn.setChecked(filter_type == "tv")
+        self.current_content_filter = filter_type
+        # If there's a search query, perform search with new filter
+        if self.search_input.text().strip():
+            self.perform_search()
+        else:
+            # Otherwise, reset home content loaded flag and reload asynchronously
+            self.home_content_loaded = False
+            self.show_home_loading()
+            QTimer.singleShot(10, self.load_home_content_async)
 
     def show_home_loading(self):
         """Show loading state in home tab"""
@@ -4190,7 +4571,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #F40612;
             }
         """)
-        back_button.clicked.connect(lambda: [self.stacked_widget.setCurrentIndex(0), self.previous_view_stack.clear()])
+        back_button.clicked.connect(self.navigate_back)
         container_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
         # Banner with backdrop image (Netflix-style horizontal banner) - cached version
@@ -4462,7 +4843,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #F40612;
             }
         """)
-        back_button.clicked.connect(lambda: [self.stacked_widget.setCurrentIndex(0), self.previous_view_stack.clear()])
+        back_button.clicked.connect(self.navigate_back)
         container_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
         # Banner with backdrop image (Netflix-style horizontal banner) - cached version
@@ -4504,19 +4885,39 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         details_layout.addWidget(title_label)
 
-        # Metadata
+        # Metadata (rating, year, runtime, genres)
         meta_parts = []
+        # Year
         if movie_data.get("release_date"):
             year = movie_data["release_date"][:4]
             meta_parts.append(year)
+        # Rating
         if movie_data.get("vote_average"):
             rating = movie_data["vote_average"]
             meta_parts.append(f"★ {rating:.1f}")
-        if movie_data.get("runtime"):
-            runtime = movie_data["runtime"]
+        # Runtime (fetch if not present)
+        runtime = movie_data.get("runtime")
+        runtime_str = None
+        if runtime is None:
+            # Try to fetch runtime from TMDB
+            movie_id = movie_data.get("id")
+            runtime = None
+            if movie_id:
+                try:
+                    details_url = f"{TMDB_API_URL}/movie/{movie_id}"
+                    response = requests.get(details_url, params={"api_key": TMDB_API_KEY}, timeout=5)
+                    if response.status_code == 200:
+                        movie_details = response.json()
+                        runtime = movie_details.get("runtime", 0)
+                except Exception:
+                    runtime = None
+        if runtime:
             hours = runtime // 60
             minutes = runtime % 60
-            meta_parts.append(f"{hours}h {minutes}m")
+            runtime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+        else:
+            runtime_str = "N/A"
+        meta_parts.append(runtime_str)
         
         metadata_label = QLabel(" • ".join(meta_parts))
         metadata_label.setStyleSheet("""
@@ -4715,7 +5116,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             self.movies_list.setIconSize(QSize(150, 225))
             self.movies_list.setGridSize(QSize(170, 270))
             self.movies_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-            self.movies_list.itemClicked.connect(self.show_media_details)
+            self.movies_list.itemClicked.connect(self.show_movie_details)
             
             # Add context menu for movies
             self.movies_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4741,7 +5142,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             self.series_list.setIconSize(QSize(150, 225))
             self.series_list.setGridSize(QSize(170, 270))
             self.series_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-            self.series_list.itemClicked.connect(self.show_series_episodes)
+            self.series_list.itemClicked.connect(self.show_series_details)
             
             # Add context menu for series
             self.series_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4890,10 +5291,24 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     
     def populate_series_list(self):
         self.series_list.clear()
+        
+        # Use a set to track processed series and avoid duplicates
+        processed_series = set()
+        
         if os.path.exists(series_folder):
             for series_name in sorted(os.listdir(series_folder)):
                 series_path = os.path.join(series_folder, series_name)
                 if os.path.isdir(series_path):
+                    # Create a normalized identifier to detect duplicates
+                    normalized_series = series_name.lower().strip()
+                    
+                    # Skip if already processed
+                    if normalized_series in processed_series:
+                        logging.warning(f"Duplicate series detected and skipped: {series_name}")
+                        continue
+                        
+                    processed_series.add(normalized_series)
+                    
                     item = QListWidgetItem(series_name)
                     poster_path = self.find_series_poster(series_path)
                     if poster_path:
@@ -5096,10 +5511,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         return None
 
     def show_series_window(self):
+        self.previous_view_stack.append(("series_list", None))
         self.populate_series_list()
         self.stacked_widget.setCurrentIndex(2)
 
     def show_series_episodes(self, item):
+        self.previous_view_stack.append(("episodes", None))
         series_path = item.data(Qt.UserRole)
         if not series_path:
             return
@@ -5306,6 +5723,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         episodes_list_layout.setSpacing(10)
 
         # Show all episodes by default, or filter by season if selected
+        displayed_episodes = set()  # Track displayed episodes to prevent duplicates
+        
         for root, _, files in os.walk(series_path):
             if self.current_season and os.path.basename(root) != self.current_season:
                 continue
@@ -5313,6 +5732,27 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             for file in sorted(files):
                 if any(file.lower().endswith(ext) for ext in media_extensions):
                     file_path = os.path.join(root, file)
+                    
+                    # Create episode identifier to prevent duplicates
+                    season_ep = self.extract_season_episode(file)
+                    if season_ep:
+                        season, episode = season_ep
+                        episode_id = f"S{season:02d}E{episode:02d}"
+                        
+                        # Skip if this episode is already displayed
+                        if episode_id in displayed_episodes:
+                            logging.warning(f"Duplicate episode detected and skipped: {file}")
+                            continue
+                            
+                        displayed_episodes.add(episode_id)
+                    else:
+                        # For episodes without clear S##E## format, use filename as identifier
+                        file_id = os.path.splitext(file)[0].lower()
+                        if file_id in displayed_episodes:
+                            logging.warning(f"Duplicate episode detected and skipped: {file}")
+                            continue
+                        displayed_episodes.add(file_id)
+                    
                     episode_item = ImageItem(file_path)
                     
                     episode_widget = QWidget()
@@ -5328,7 +5768,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     info_layout = QVBoxLayout()
                     info_layout.setSpacing(2)
                     
-                    season_ep = self.extract_season_episode(file)
                     if season_ep:
                         season, episode = season_ep
                         ep_num_label = QLabel(f"S{season:02d}E{episode:02d}")
@@ -5346,7 +5785,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                         background-color: #232323;
                         border-radius: 6px;
                     """)
-                    episode_widget.mousePressEvent = lambda e, ep=episode_item: self.show_media_details(ep)
+                    episode_widget.mousePressEvent = lambda e, ep=episode_item, sp=series_path: self.show_episode_details(ep, parent_series_path=sp)
                     
                     # Add context menu for episodes
                     episode_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -5592,7 +6031,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             logging.error(f"Error getting TMDB backdrop for {series_name}: {str(e)}")
             return None
 
-    def create_poster_banner(self, pixmap, width=900, height=300):
+    def create_poster_banner(self, pixmap, width=900, height=3080):
         """Create a Netflix-style banner from backdrop image - standard scaling approach"""
         if pixmap.isNull():
             banner = QPixmap(width, height)
@@ -5609,11 +6048,13 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         # Scale image to fill the entire banner (may crop edges but fills completely)
         scaled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         
-        # Center the scaled image in the banner
+        # Always align the top of the image with the top of the banner (touches title bar)
         x = (width - scaled.width()) // 2
-        y = (height - scaled.height()) // 2
-        
-        # Draw the image to fill the banner completely
+        if scaled.height() > height:
+            y = 0  # Top of image flush with top of banner
+        else:
+            y = 0  # If image is shorter, still align to top
+
         painter.drawPixmap(x, y, scaled)
         
         # Add subtle gradient overlay for text readability (lighter than before)
@@ -5627,7 +6068,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         painter.end()
         return banner
 
-    def show_media_details(self, item):
+
+    def show_movie_details(self, item):
+        # Movie details view (for movies tab)
         for i in reversed(range(self.details_layout.count())):
             widget = self.details_layout.itemAt(i).widget()
             if widget:
@@ -5648,18 +6091,16 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #F40612;
             }
         """)
-        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))  # Always go back to movies view
+        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))  # Go back to movies view
         self.details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
         # Try to get TMDB backdrop for better banner
         backdrop_used = False
         movie_title = self.extract_movie_title(item.text())
         backdrop_data = self.get_tmdb_movie_backdrop(movie_title)
-        
         if backdrop_data:
             backdrop_path = backdrop_data.get("backdrop_path")
             if backdrop_path:
-                # Create banner label placeholder
                 banner_label = QLabel()
                 banner_label.setFixedHeight(300)
                 banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -5673,32 +6114,24 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     }
                 """)
                 banner_label.setAlignment(Qt.AlignCenter)
-                banner_label.setText("🎬")  # Placeholder while loading
+                banner_label.setText("🎬")
                 self.details_layout.addWidget(banner_label)
-                
-                # Load backdrop asynchronously with caching
                 self.load_backdrop_async(banner_label, backdrop_path, "🎬", movie_title)
                 backdrop_used = True
-        
-        # Fallback to cached backdrop search or proper no-backdrop message if backdrop failed
+
         if not backdrop_used:
             banner_label = QLabel()
-            banner_label.setFixedHeight(300)  # Same height as backdrop banner
+            banner_label.setFixedHeight(300)
             banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            
-            # Try to find cached backdrop for this movie
             cached_backdrop_found = False
             try:
                 safe_title = "".join(c for c in movie_title if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
                 year = extract_year(item.text())
-                
-                # Try different cache filename formats
                 possible_cache_names = [
                     f"movie_{safe_title}_{year}.jpg".replace(' ', '_') if year else None,
                     f"movie_{safe_title}_no_year.jpg".replace(' ', '_'),
                     f"movie_{safe_title}_Unknown.jpg".replace(' ', '_'),
                 ]
-                
                 for cache_name in possible_cache_names:
                     if cache_name is None:
                         continue
@@ -5706,17 +6139,13 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     if os.path.exists(cache_path):
                         cached_pixmap = QPixmap(cache_path)
                         if not cached_pixmap.isNull():
-                            # Create proper banner with cached backdrop
                             banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
                             banner_label.setPixmap(banner)
                             cached_backdrop_found = True
                             break
-                
             except Exception as e:
                 logging.error(f"Error loading cached backdrop for {movie_title}: {str(e)}")
-            
             if not cached_backdrop_found:
-                # Show proper "no backdrop available" message instead of stretched poster
                 banner_label.setText("🎬\n\nNo Backdrop Available\nBackdrops will load when online")
                 banner_label.setStyleSheet("""
                     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -5732,12 +6161,10 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 """)
                 banner_label.setAlignment(Qt.AlignCenter)
                 banner_label.setWordWrap(True)
-            
             self.details_layout.addWidget(banner_label)
 
         details_widget = QWidget()
         details_layout = QVBoxLayout(details_widget)
-
         title_label = QLabel(item.text())
         title_label.setStyleSheet("""
             font-size: 28px; 
@@ -5747,7 +6174,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             margin-bottom: 10px;
         """)
         details_layout.addWidget(title_label)
-
         meta_parts = []
         if getattr(item, "release_year", None):
             meta_parts.append(str(item.release_year))
@@ -5763,7 +6189,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
         """)
         details_layout.addWidget(metadata_label)
-
         synopsis_label = QLabel("Synopsis")
         synopsis_label.setStyleSheet("""
             font-size: 18px; 
@@ -5773,7 +6198,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             margin-bottom: 5px;
         """)
         details_layout.addWidget(synopsis_label)
-
         synopsis_text = QTextEdit()
         synopsis_text.setPlainText(item.synopsis if hasattr(item, 'synopsis') and item.synopsis else "Synopsis not available")
         synopsis_text.setReadOnly(True)
@@ -5789,7 +6213,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         synopsis_text.setFixedHeight(150)
         details_layout.addWidget(synopsis_text)
-
         play_button = QPushButton("Play")
         play_button.setStyleSheet("""
             QPushButton {
@@ -5808,7 +6231,180 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         play_button.clicked.connect(lambda: self.play_media(item))
         details_layout.addWidget(play_button)
+        details_layout.addStretch()
+        self.details_layout.addWidget(details_widget)
+        self.stacked_widget.setCurrentIndex(4)
 
+    def show_series_details(self, item, parent_series_path=None):
+        # Series details view (for series tab)
+        for i in reversed(range(self.details_layout.count())):
+            widget = self.details_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+
+        back_button = QPushButton("Back")
+        back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                max-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        if parent_series_path:
+            back_button.clicked.connect(lambda: self.show_series_episodes(self._make_series_item(parent_series_path)))
+        else:
+            back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
+        self.details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+
+    def _make_series_item(self, series_path):
+        item = QListWidgetItem(os.path.basename(series_path))
+        item.setData(Qt.UserRole, series_path)
+        return item
+
+        # Try to get TMDB backdrop for better banner (series)
+        backdrop_used = False
+        series_title = item.text()
+        backdrop_data = self.get_tmdb_series_backdrop(series_title)
+        if backdrop_data:
+            backdrop_path = backdrop_data.get("backdrop_path")
+            if backdrop_path:
+                banner_label = QLabel()
+                banner_label.setFixedHeight(300)
+                banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                banner_label.setStyleSheet("""
+                    QLabel {
+                        border-radius: 8px;
+                        background-color: #222;
+                        color: #666;
+                        font-size: 48px;
+                        text-align: center;
+                    }
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setText("🎬")
+                self.details_layout.addWidget(banner_label)
+                self.load_backdrop_async(banner_label, backdrop_path, "🎬", series_title)
+                backdrop_used = True
+
+        if not backdrop_used:
+            banner_label = QLabel()
+            banner_label.setFixedHeight(300)
+            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            cached_backdrop_found = False
+            try:
+                safe_title = "".join(c for c in series_title if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+                year = extract_year(series_title)
+                possible_cache_names = [
+                    f"series_{safe_title}_{year}.jpg".replace(' ', '_') if year else None,
+                    f"series_{safe_title}_no_year.jpg".replace(' ', '_'),
+                    f"series_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                ]
+                for cache_name in possible_cache_names:
+                    if cache_name is None:
+                        continue
+                    cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_name)
+                    if os.path.exists(cache_path):
+                        cached_pixmap = QPixmap(cache_path)
+                        if not cached_pixmap.isNull():
+                            banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
+                            banner_label.setPixmap(banner)
+                            cached_backdrop_found = True
+                            break
+            except Exception as e:
+                logging.error(f"Error loading cached backdrop for {series_title}: {str(e)}")
+            if not cached_backdrop_found:
+                banner_label.setText("🎬\n\nNo Backdrop Available\nBackdrops will load when online")
+                banner_label.setStyleSheet("""
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1a1a1a, stop:1 #2a2a2a);
+                    border-radius: 8px;
+                    border: 2px dashed #444;
+                    text-align: center;
+                    color: #888;
+                    font-size: 16px;
+                    font-family: 'Netflix Sans', 'Arial', sans-serif;
+                    padding: 20px;
+                    line-height: 1.4;
+                """)
+                banner_label.setAlignment(Qt.AlignCenter)
+                banner_label.setWordWrap(True)
+            self.details_layout.addWidget(banner_label)
+
+        details_widget = QWidget()
+        details_layout = QVBoxLayout(details_widget)
+        title_label = QLabel(series_title)
+        title_label.setStyleSheet("""
+            font-size: 28px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            margin-bottom: 10px;
+        """)
+        details_layout.addWidget(title_label)
+        meta_parts = []
+        if getattr(item, "release_year", None):
+            meta_parts.append(str(item.release_year))
+        if getattr(item, "genres", None):
+            meta_parts.append(", ".join(item.genres))
+        if getattr(item, "imdb_rating", None):
+            meta_parts.append(f"IMDb: ★ {item.imdb_rating:.1f}")
+        metadata_label = QLabel(" • ".join(meta_parts))
+        metadata_label.setStyleSheet("""
+            font-size: 16px; 
+            color: #AAAAAA; 
+            margin-bottom: 20px;
+            font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+        """)
+        details_layout.addWidget(metadata_label)
+        synopsis_label = QLabel("Synopsis")
+        synopsis_label.setStyleSheet("""
+            font-size: 18px; 
+            font-weight: bold; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
+            margin-bottom: 5px;
+        """)
+        details_layout.addWidget(synopsis_label)
+        synopsis_text = QTextEdit()
+        synopsis_text.setPlainText(item.synopsis if hasattr(item, 'synopsis') and item.synopsis else "Synopsis not available")
+        synopsis_text.setReadOnly(True)
+        synopsis_text.setStyleSheet("""
+            QTextEdit {
+                background-color: transparent;
+                color: white;
+                border: none;
+                padding: 10px;
+                font-size: 14px;
+                font-family: 'Netflix Sans Medium', 'Netflix Sans', 'Arial', sans-serif;
+            }
+        """)
+        synopsis_text.setFixedHeight(150)
+        details_layout.addWidget(synopsis_text)
+        play_button = QPushButton("Play")
+        play_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                font-size: 18px;
+                border-radius: 4px;
+                margin-top: 20px;
+                max-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        play_button.clicked.connect(lambda: self.play_media(item))
+        details_layout.addWidget(play_button)
         details_layout.addStretch()
         self.details_layout.addWidget(details_widget)
         self.stacked_widget.setCurrentIndex(4)
@@ -5822,13 +6418,28 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def update_media_lists(self):
         """Synchronous version for immediate loading"""
         self.movies_list.clear()
+        
+        # Use a set to track processed files and avoid duplicates
+        processed_files = set()
+        
         if os.path.exists(movies_folder):
             for root, _, files in os.walk(movies_folder):
                 for file in files:
                     if any(file.lower().endswith(ext) for ext in media_extensions):
                         file_path = os.path.join(root, file)
+                        
+                        # Create a normalized identifier to detect duplicates
+                        normalized_path = os.path.normpath(file_path).lower()
+                        
+                        # Skip if already processed
+                        if normalized_path in processed_files:
+                            logging.warning(f"Duplicate movie detected and skipped: {file_path}")
+                            continue
+                            
+                        processed_files.add(normalized_path)
                         item = ImageItem(file_path)
                         self.movies_list.addItem(item)
+        
         self.media_lists_loaded = True
 
     def update_media_lists_async(self):
@@ -5849,12 +6460,25 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.media_files = []
         self.current_file_index = 0
         
+        # Use a set to track processed files and avoid duplicates
+        processed_files = set()
+        
         # Collect all media files first
         if os.path.exists(movies_folder):
             for root, _, files in os.walk(movies_folder):
                 for file in files:
                     if any(file.lower().endswith(ext) for ext in media_extensions):
                         file_path = os.path.join(root, file)
+                        
+                        # Create a normalized identifier to detect duplicates
+                        normalized_path = os.path.normpath(file_path).lower()
+                        
+                        # Skip if already processed
+                        if normalized_path in processed_files:
+                            logging.warning(f"Duplicate movie detected and skipped: {file_path}")
+                            continue
+                            
+                        processed_files.add(normalized_path)
                         self.media_files.append(file_path)
         
         # Process files in batches
@@ -5986,6 +6610,699 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         ret = msg.exec_()
         if ret == QMessageBox.Yes:
             self.sort_files()
+    
+    def find_and_remove_duplicates(self):
+        """Find and optionally remove duplicate movies and series"""
+        duplicates_found = []
+        
+        try:
+            # Find movie duplicates
+            movie_duplicates = self.find_movie_duplicates()
+            if movie_duplicates:
+                duplicates_found.extend(movie_duplicates)
+            
+            # Find series duplicates
+            series_duplicates = self.find_series_duplicates()
+            if series_duplicates:
+                duplicates_found.extend(series_duplicates)
+            
+            if duplicates_found:
+                # Show duplicates dialog
+                self.show_duplicates_dialog(duplicates_found)
+            else:
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Information)
+                msg.setText("No duplicates found in your media library!")
+                msg.setWindowTitle("Duplicate Check Complete")
+                msg.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #141414;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                    }
+                    QMessageBox QPushButton {
+                        background-color: #E50914;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        font-size: 14px;
+                        border-radius: 4px;
+                    }
+                """)
+                msg.exec_()
+                
+        except Exception as e:
+            logging.error(f"Error finding duplicates: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error while checking for duplicates:\n{str(e)}")
+    
+    def find_movie_duplicates(self):
+        """Find duplicate movies based on title similarity and file size"""
+        duplicates = []
+        processed_files = set()
+        
+        if not os.path.exists(movies_folder):
+            return duplicates
+        
+        movie_files = []
+        for root, _, files in os.walk(movies_folder):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in media_extensions):
+                    file_path = os.path.join(root, file)
+                    movie_files.append(file_path)
+        
+        # Compare each movie with every other movie
+        for i, file1 in enumerate(movie_files):
+            if file1 in processed_files:
+                continue
+                
+            title1 = self.extract_movie_title(os.path.basename(file1)).lower()
+            try:
+                size1 = os.path.getsize(file1)
+            except OSError:
+                continue  # Skip files we can't read
+            
+            duplicate_group = [file1]
+            
+            for j, file2 in enumerate(movie_files[i+1:], i+1):
+                if file2 in processed_files:
+                    continue
+                    
+                title2 = self.extract_movie_title(os.path.basename(file2)).lower()
+                try:
+                    size2 = os.path.getsize(file2)
+                except OSError:
+                    continue
+                
+                # Check if titles are similar
+                if self.are_titles_similar(title1, title2):
+                    # Check size difference (allow up to 30% difference for quality variations)
+                    size_diff = abs(size1 - size2) / max(size1, size2)
+                    if size_diff < 0.3:
+                        duplicate_group.append(file2)
+                        processed_files.add(file2)
+            
+            if len(duplicate_group) > 1:
+                # Sort group by size (largest first) for better removal logic
+                duplicate_group_with_info = []
+                for file_path in duplicate_group:
+                    try:
+                        size = os.path.getsize(file_path)
+                        mtime = os.path.getmtime(file_path)
+                        duplicate_group_with_info.append((file_path, size, mtime))
+                    except OSError:
+                        duplicate_group_with_info.append((file_path, 0, 0))
+                
+                # Sort by size (largest first), then by modification time (newest first)
+                duplicate_group_with_info.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                sorted_files = [info[0] for info in duplicate_group_with_info]
+                
+                duplicates.append({
+                    'type': 'movie',
+                    'title': title1,
+                    'files': sorted_files
+                })
+                processed_files.update(duplicate_group)
+        
+        return duplicates
+    
+    def find_series_duplicates(self):
+        """Find duplicate series based on name similarity"""
+        duplicates = []
+        
+        if not os.path.exists(series_folder):
+            return duplicates
+        
+        series_dirs = []
+        for item in os.listdir(series_folder):
+            series_path = os.path.join(series_folder, item)
+            if os.path.isdir(series_path):
+                series_dirs.append((item, series_path))
+        
+        processed_series = set()
+        
+        # Compare each series with every other series
+        for i, (name1, path1) in enumerate(series_dirs):
+            if name1 in processed_series:
+                continue
+                
+            clean_name1 = name1.lower().strip()
+            duplicate_group = [(name1, path1)]
+            
+            for j, (name2, path2) in enumerate(series_dirs[i+1:], i+1):
+                if name2 in processed_series:
+                    continue
+                    
+                clean_name2 = name2.lower().strip()
+                
+                # Check if series names are very similar
+                if self.are_titles_similar(clean_name1, clean_name2, threshold=0.9):
+                    duplicate_group.append((name2, path2))
+                    processed_series.add(name2)
+            
+            if len(duplicate_group) > 1:
+                duplicates.append({
+                    'type': 'series',
+                    'title': clean_name1,
+                    'folders': duplicate_group
+                })
+                processed_series.update([name for name, _ in duplicate_group])
+        
+        return duplicates
+    
+    def show_duplicates_dialog(self, duplicates):
+        """Show a dialog with found duplicates and options to remove them"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Duplicate Media Found")
+        dialog.setFixedSize(900, 700)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #141414;
+                color: white;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Header
+        header_label = QLabel(f"Found {len(duplicates)} duplicate groups:")
+        header_label.setStyleSheet("""
+            font-size: 18px; 
+            font-weight: bold; 
+            color: white;
+            margin-bottom: 10px;
+        """)
+        layout.addWidget(header_label)
+        
+        # Options for handling duplicates
+        options_widget = QWidget()
+        options_layout = QHBoxLayout(options_widget)
+        options_layout.setSpacing(15)
+        
+        self.duplicate_action = "keep_largest"  # Default action
+        
+        # Radio buttons for different actions
+        keep_largest_radio = QRadioButton("Keep largest file (recommended)")
+        keep_largest_radio.setChecked(True)
+        keep_largest_radio.setStyleSheet("color: white; font-size: 14px;")
+        keep_largest_radio.toggled.connect(lambda: setattr(self, 'duplicate_action', 'keep_largest'))
+        options_layout.addWidget(keep_largest_radio)
+        
+        keep_newest_radio = QRadioButton("Keep newest file")
+        keep_newest_radio.setStyleSheet("color: white; font-size: 14px;")
+        keep_newest_radio.toggled.connect(lambda: setattr(self, 'duplicate_action', 'keep_newest'))
+        options_layout.addWidget(keep_newest_radio)
+        
+        manual_review_radio = QRadioButton("Manual review only")
+        manual_review_radio.setStyleSheet("color: white; font-size: 14px;")
+        manual_review_radio.toggled.connect(lambda: setattr(self, 'duplicate_action', 'manual'))
+        options_layout.addWidget(manual_review_radio)
+        
+        layout.addWidget(options_widget)
+        
+        # Scrollable list of duplicates with checkboxes
+        scroll_area = QScrollArea()
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        self.duplicate_checkboxes = []  # Store checkboxes for each duplicate group
+        
+        for i, duplicate in enumerate(duplicates):
+            group_widget = QWidget()
+            group_widget.setStyleSheet("""
+                QWidget {
+                    background-color: #1A1A1A;
+                    border-radius: 8px;
+                    margin: 5px 0px;
+                    padding: 10px;
+                }
+            """)
+            group_layout = QVBoxLayout(group_widget)
+            
+            # Group header with checkbox
+            header_widget = QWidget()
+            header_layout = QHBoxLayout(header_widget)
+            
+            group_checkbox = QCheckBox()
+            group_checkbox.setChecked(True)  # Check all by default
+            group_checkbox.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; }")
+            header_layout.addWidget(group_checkbox)
+            self.duplicate_checkboxes.append((group_checkbox, duplicate))
+            
+            if duplicate['type'] == 'movie':
+                title_label = QLabel(f"🎬 Movie: {duplicate['title']}")
+                header_layout.addWidget(title_label)
+                header_layout.addStretch()
+                group_layout.addWidget(header_widget)
+                
+                # Show file details
+                for j, file_path in enumerate(duplicate['files']):
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        file_size_mb = file_size / (1024 * 1024)
+                        file_time = os.path.getmtime(file_path)
+                        file_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(file_time))
+                        
+                        file_info = f"   📄 {os.path.basename(file_path)} ({file_size_mb:.1f}MB, {file_date})"
+                        if j == 0:  # Mark the first (typically largest/newest) as what will be kept
+                            file_info += " ✓ KEEP"
+                            color = "#4CAF50"
+                        else:
+                            file_info += " ❌ REMOVE"
+                            color = "#F44336"
+                            
+                        file_label = QLabel(file_info)
+                        file_label.setStyleSheet(f"color: {color}; margin-left: 20px; font-size: 12px;")
+                        group_layout.addWidget(file_label)
+                    except OSError:
+                        file_label = QLabel(f"   📄 {os.path.basename(file_path)} (Error reading file)")
+                        file_label.setStyleSheet("color: #AAAAAA; margin-left: 20px; font-size: 12px;")
+                        group_layout.addWidget(file_label)
+            else:  # series
+                title_label = QLabel(f"📺 Series: {duplicate['title']}")
+                header_layout.addWidget(title_label)
+                header_layout.addStretch()
+                group_layout.addWidget(header_widget)
+                
+                for j, (name, path) in enumerate(duplicate['folders']):
+                    folder_info = f"   📁 {name}"
+                    if j == 0:
+                        folder_info += " ✓ KEEP"
+                        color = "#4CAF50"
+                    else:
+                        folder_info += " ❌ REMOVE"
+                        color = "#F44336"
+                        
+                    folder_label = QLabel(folder_info)
+                    folder_label.setStyleSheet(f"color: {color}; margin-left: 20px; font-size: 12px;")
+                    group_layout.addWidget(folder_label)
+            
+            title_label.setStyleSheet("font-weight: bold; color: #E50914; font-size: 14px;")
+            scroll_layout.addWidget(group_widget)
+        
+        scroll_area.setWidget(scroll_widget)
+        scroll_area.setWidgetResizable(True)
+        layout.addWidget(scroll_area)
+        
+        # Action buttons
+        button_layout = QHBoxLayout()
+        
+        # Select/Deselect all
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2D2D2D;
+                color: white;
+                border: 1px solid #555555;
+                padding: 8px 16px;
+                font-size: 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3D3D3D;
+            }
+        """)
+        select_all_btn.clicked.connect(lambda: self.toggle_all_duplicates(True))
+        button_layout.addWidget(select_all_btn)
+        
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2D2D2D;
+                color: white;
+                border: 1px solid #555555;
+                padding: 8px 16px;
+                font-size: 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3D3D3D;
+            }
+        """)
+        deselect_all_btn.clicked.connect(lambda: self.toggle_all_duplicates(False))
+        button_layout.addWidget(deselect_all_btn)
+        
+        button_layout.addStretch()
+        
+        # Main action buttons
+        remove_btn = QPushButton("🗑️ Remove Selected Duplicates")
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        remove_btn.clicked.connect(lambda: self.remove_selected_duplicates(dialog))
+        button_layout.addWidget(remove_btn)
+        
+        close_btn = QPushButton("Cancel")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666666;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #777777;
+            }
+        """)
+        close_btn.clicked.connect(dialog.close)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def toggle_all_duplicates(self, checked):
+        """Toggle all duplicate checkboxes"""
+        for checkbox, _ in self.duplicate_checkboxes:
+            checkbox.setChecked(checked)
+    
+    def remove_selected_duplicates(self, dialog):
+        """Remove selected duplicates based on user preferences"""
+        if not hasattr(self, 'duplicate_checkboxes'):
+            return
+            
+        selected_duplicates = []
+        for checkbox, duplicate in self.duplicate_checkboxes:
+            if checkbox.isChecked():
+                selected_duplicates.append(duplicate)
+        
+        if not selected_duplicates:
+            QMessageBox.information(dialog, "No Selection", "No duplicates selected for removal.")
+            return
+        
+        # Confirm removal
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(f"Are you sure you want to remove duplicates from {len(selected_duplicates)} groups?")
+        msg.setInformativeText(f"Action: {self.duplicate_action.replace('_', ' ').title()}")
+        msg.setWindowTitle("Confirm Duplicate Removal")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #141414;
+            }
+            QMessageBox QLabel {
+                color: white;
+            }
+            QMessageBox QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        
+        if msg.exec_() != QMessageBox.Yes:
+            return
+        
+        # Process removals
+        removed_count = 0
+        errors = []
+        
+        for duplicate in selected_duplicates:
+            try:
+                if duplicate['type'] == 'movie':
+                    removed = self.remove_duplicate_movies(duplicate)
+                    removed_count += removed
+                else:
+                    removed = self.remove_duplicate_series(duplicate)
+                    removed_count += removed
+            except Exception as e:
+                errors.append(f"Error processing {duplicate['title']}: {str(e)}")
+        
+        # Show results
+        dialog.close()
+        
+        if errors:
+            error_msg = QMessageBox()
+            error_msg.setIcon(QMessageBox.Warning)
+            error_msg.setText(f"Removed {removed_count} duplicates with some errors:")
+            error_msg.setDetailedText("\n".join(errors))
+            error_msg.setWindowTitle("Duplicate Removal Complete")
+            error_msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #141414;
+                }
+                QMessageBox QLabel {
+                    color: white;
+                }
+                QMessageBox QPushButton {
+                    background-color: #E50914;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    font-size: 14px;
+                    border-radius: 4px;
+                }
+            """)
+            error_msg.exec_()
+        else:
+            success_msg = QMessageBox()
+            success_msg.setIcon(QMessageBox.Information)
+            success_msg.setText(f"Successfully removed {removed_count} duplicate files!")
+            success_msg.setWindowTitle("Duplicates Removed")
+            success_msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #141414;
+                }
+                QMessageBox QLabel {
+                    color: white;
+                }
+                QMessageBox QPushButton {
+                    background-color: #E50914;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    font-size: 14px;
+                    border-radius: 4px;
+                }
+            """)
+            success_msg.exec_()
+        
+        # Refresh the media lists
+        self.update_media_lists()
+        self.populate_series_list()
+    
+    def remove_duplicate_movies(self, duplicate):
+        """Remove duplicate movie files, keeping the best one"""
+        files = duplicate['files']
+        if len(files) <= 1:
+            return 0
+        
+        # Determine which file to keep based on user preference
+        if self.duplicate_action == 'keep_largest':
+            # Sort by file size (largest first)
+            files_with_info = []
+            for file_path in files:
+                try:
+                    size = os.path.getsize(file_path)
+                    files_with_info.append((file_path, size, 0))
+                except OSError:
+                    files_with_info.append((file_path, 0, 0))  # If can't get size, put at end
+            files_with_info.sort(key=lambda x: x[1], reverse=True)
+            keep_file = files_with_info[0][0]
+            remove_files = [info[0] for info in files_with_info[1:]]
+        
+        elif self.duplicate_action == 'keep_newest':
+            # Sort by modification time (newest first)
+            files_with_info = []
+            for file_path in files:
+                try:
+                    mtime = os.path.getmtime(file_path)
+                    files_with_info.append((file_path, 0, mtime))
+                except OSError:
+                    files_with_info.append((file_path, 0, 0))
+            files_with_info.sort(key=lambda x: x[2], reverse=True)
+            keep_file = files_with_info[0][0]
+            remove_files = [info[0] for info in files_with_info[1:]]
+        
+        else:  # manual review
+            return 0  # Don't remove anything in manual mode
+        
+        # Remove the duplicate files
+        removed_count = 0
+        for file_path in remove_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logging.info(f"Removed duplicate movie: {file_path}")
+                    removed_count += 1
+            except Exception as e:
+                logging.error(f"Failed to remove {file_path}: {str(e)}")
+                raise
+        
+        return removed_count
+    
+    def remove_duplicate_series(self, duplicate):
+        """Remove duplicate series folders, keeping the first one"""
+        folders = duplicate['folders']
+        if len(folders) <= 1:
+            return 0
+        
+        if self.duplicate_action == 'manual':
+            return 0  # Don't remove anything in manual mode
+        
+        # Keep the first folder (usually the one with more episodes or better organized)
+        keep_folder = folders[0][1]
+        remove_folders = [folder[1] for folder in folders[1:]]
+        
+        removed_count = 0
+        for folder_path in remove_folders:
+            try:
+                if os.path.exists(folder_path):
+                    # Count files before removal for reporting
+                    file_count = 0
+                    for root, _, files in os.walk(folder_path):
+                        file_count += len([f for f in files if any(f.lower().endswith(ext) for ext in media_extensions)])
+                    
+                    shutil.rmtree(folder_path)
+                    logging.info(f"Removed duplicate series folder: {folder_path}")
+                    removed_count += file_count
+            except Exception as e:
+                logging.error(f"Failed to remove {folder_path}: {str(e)}")
+                raise
+        
+        return removed_count
+    
+    def auto_remove_duplicates(self, keep_largest=True):
+        """Automatically remove duplicates without user interaction"""
+        try:
+            # Find duplicates
+            duplicates_found = []
+            
+            # Find movie duplicates
+            movie_duplicates = self.find_movie_duplicates()
+            if movie_duplicates:
+                duplicates_found.extend(movie_duplicates)
+            
+            # Find series duplicates
+            series_duplicates = self.find_series_duplicates()
+            if series_duplicates:
+                duplicates_found.extend(series_duplicates)
+            
+            if not duplicates_found:
+                return 0, "No duplicates found in your media library."
+            
+            # Set removal preference
+            self.duplicate_action = 'keep_largest' if keep_largest else 'keep_newest'
+            
+            # Remove duplicates automatically
+            removed_count = 0
+            errors = []
+            
+            for duplicate in duplicates_found:
+                try:
+                    if duplicate['type'] == 'movie':
+                        removed = self.remove_duplicate_movies(duplicate)
+                        removed_count += removed
+                    else:
+                        removed = self.remove_duplicate_series(duplicate)
+                        removed_count += removed
+                except Exception as e:
+                    errors.append(f"Error processing {duplicate['title']}: {str(e)}")
+            
+            # Refresh the media lists
+            if removed_count > 0:
+                self.update_media_lists()
+                self.populate_series_list()
+            
+            if errors:
+                return removed_count, f"Removed {removed_count} duplicates with errors: " + "; ".join(errors)
+            else:
+                return removed_count, f"Successfully removed {removed_count} duplicate files."
+                
+        except Exception as e:
+            logging.error(f"Error in auto_remove_duplicates: {str(e)}")
+            return 0, f"Error during automatic duplicate removal: {str(e)}"
+    
+    def clean_cache_duplicates(self):
+        """Clean up duplicate entries in cache directories"""
+        try:
+            cache_dirs = [POSTER_CACHE_DIR, SYNOPSIS_CACHE_DIR, BACKDROP_CACHE_DIR]
+            cleaned_count = 0
+            
+            for cache_dir in cache_dirs:
+                if not os.path.exists(cache_dir):
+                    continue
+                    
+                # Group cache files by similar names
+                cache_files = {}
+                for filename in os.listdir(cache_dir):
+                    file_path = os.path.join(cache_dir, filename)
+                    if os.path.isfile(file_path):
+                        # Extract base name for grouping
+                        base_name = filename.lower()
+                        # Remove year and file extension for comparison
+                        base_name = re.sub(r'_\d{4}', '', base_name)
+                        base_name = re.sub(r'\.(jpg|jpeg|png|txt)$', '', base_name)
+                        
+                        if base_name not in cache_files:
+                            cache_files[base_name] = []
+                        cache_files[base_name].append((filename, file_path))
+                
+                # Find duplicates within each group
+                for base_name, files in cache_files.items():
+                    if len(files) > 1:
+                        # Sort by modification time, keep the newest
+                        files.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                        
+                        # Remove older duplicates
+                        for filename, file_path in files[1:]:
+                            try:
+                                os.remove(file_path)
+                                cleaned_count += 1
+                                logging.info(f"Removed duplicate cache file: {filename}")
+                            except OSError as e:
+                                logging.error(f"Error removing cache file {filename}: {e}")
+            
+            if cleaned_count > 0:
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Information)
+                msg.setText(f"Cleaned {cleaned_count} duplicate cache files!")
+                msg.setWindowTitle("Cache Cleanup Complete")
+                msg.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #141414;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                    }
+                    QMessageBox QPushButton {
+                        background-color: #E50914;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        font-size: 14px;
+                        border-radius: 4px;
+                    }
+                """)
+                msg.exec_()
+            else:
+                logging.info("No duplicate cache files found.")
+                
+        except Exception as e:
+            logging.error(f"Error cleaning cache duplicates: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error while cleaning cache:\n{str(e)}")
 
     def play_media(self, item):
         try:
@@ -6254,12 +7571,29 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     self.process_downloads_folder(downloads_folder)
                 else:
                     logging.error(f"Downloads folder not found: {downloads_folder}")
+            
             self.update_media_lists()
+            
+            # Check for any new duplicates that might have been created
+            duplicates_found = []
+            movie_duplicates = self.find_movie_duplicates()
+            series_duplicates = self.find_series_duplicates()
+            
+            if movie_duplicates:
+                duplicates_found.extend(movie_duplicates)
+            if series_duplicates:
+                duplicates_found.extend(series_duplicates)
             
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Information)
-            msg.setText("Files have been sorted successfully!")
-            msg.setWindowTitle("Success")
+            
+            if duplicates_found:
+                msg.setText(f"Files have been sorted successfully!\n\nFound {len(duplicates_found)} potential duplicate groups.\nYou can review and remove them in Settings → Find & Remove Duplicates.")
+                msg.setWindowTitle("Sorting Complete - Duplicates Detected")
+            else:
+                msg.setText("Files have been sorted successfully!\n\nNo duplicates detected.")
+                msg.setWindowTitle("Sorting Complete")
+                
             msg.setStyleSheet("""
                 QMessageBox {
                     background-color: #141414;
@@ -6288,6 +7622,11 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 continue
             try:
                 if any(file_name.lower().endswith(ext) for ext in media_extensions):
+                    # Check for potential duplicates before moving
+                    if self.is_potential_duplicate(file_path):
+                        logging.warning(f"Potential duplicate detected: {file_name}")
+                        # Still proceed but with extra logging
+                    
                     file_name_with_spaces = self.replace_underscores_and_dots(file_name)
                     series_name, season, year = extract_series_info(file_name_with_spaces)
                     if series_name and season:
@@ -6298,6 +7637,83 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             except Exception as e:
                 logging.error(f"Failed to process {file_name}: {str(e)}")
     
+    def is_potential_duplicate(self, file_path):
+        """Check if a file might be a duplicate of existing content"""
+        try:
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            
+            # Extract title for comparison
+            clean_title = self.extract_movie_title(file_name).lower()
+            
+            # Check against existing movies
+            if os.path.exists(movies_folder):
+                for root, _, files in os.walk(movies_folder):
+                    for existing_file in files:
+                        if any(existing_file.lower().endswith(ext) for ext in media_extensions):
+                            existing_title = self.extract_movie_title(existing_file).lower()
+                            existing_path = os.path.join(root, existing_file)
+                            
+                            # Check for title similarity
+                            if self.are_titles_similar(clean_title, existing_title):
+                                try:
+                                    existing_size = os.path.getsize(existing_path)
+                                    size_diff = abs(file_size - existing_size) / max(file_size, existing_size)
+                                    
+                                    # If titles are very similar and sizes are close, likely duplicate
+                                    if size_diff < 0.1:  # Less than 10% size difference
+                                        logging.warning(f"Potential duplicate found: '{file_name}' vs '{existing_file}'")
+                                        return True
+                                except OSError:
+                                    pass
+            
+            # Check against existing series if it's detected as series content
+            series_name, season, year = extract_series_info(file_name)
+            if series_name and os.path.exists(series_folder):
+                series_path = os.path.join(series_folder, series_name)
+                if os.path.exists(series_path):
+                    for root, _, files in os.walk(series_path):
+                        for existing_file in files:
+                            if any(existing_file.lower().endswith(ext) for ext in media_extensions):
+                                # Check for episode duplicates (same season/episode)
+                                existing_season_ep = self.extract_season_episode(existing_file)
+                                new_season_ep = self.extract_season_episode(file_name)
+                                
+                                if (existing_season_ep and new_season_ep and 
+                                    existing_season_ep == new_season_ep):
+                                    logging.warning(f"Potential episode duplicate: '{file_name}' vs '{existing_file}'")
+                                    return True
+            
+            return False
+        except Exception as e:
+            logging.error(f"Error checking for duplicates: {str(e)}")
+            return False
+    
+    def are_titles_similar(self, title1, title2, threshold=0.8):
+        """Check if two titles are similar using a simple similarity metric"""
+        # Remove common words and clean titles
+        common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        
+        def clean_title(title):
+            # Remove special characters and split into words
+            import re
+            words = re.findall(r'\b\w+\b', title.lower())
+            # Remove common words
+            return set(word for word in words if word not in common_words and len(word) > 2)
+        
+        words1 = clean_title(title1)
+        words2 = clean_title(title2)
+        
+        if not words1 or not words2:
+            return False
+        
+        # Calculate Jaccard similarity
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+        
+        similarity = intersection / union if union > 0 else 0
+        return similarity >= threshold
+    
     def replace_underscores_and_dots(self, file_name):
         return file_name.replace('_', ' ').replace('.', ' ')
     
@@ -6305,9 +7721,23 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         base_name, extension = os.path.splitext(file_name)
         unique_name = file_name
         counter = 1
+        
+        # First check if exact file already exists
+        dest_path = os.path.join(dest_folder, unique_name)
+        if os.path.exists(dest_path):
+            # Check if it's the same file (by size and name similarity)
+            try:
+                existing_size = os.path.getsize(dest_path)
+                # If files have same name pattern and similar size, it might be a duplicate
+                logging.info(f"File with similar name already exists: {dest_path} (size: {existing_size})")
+            except OSError:
+                pass
+                
+        # Generate unique name if needed
         while os.path.exists(os.path.join(dest_folder, unique_name)):
             unique_name = f"{base_name}_{counter}{extension}"
             counter += 1
+            
         return unique_name
     
     def ensure_directory_exists(self, directory):
@@ -6683,11 +8113,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             }
             QPushButton:hover {
                 background-color: #F40612;
-                transform: translateY(-1px);
             }
             QPushButton:pressed {
                 background-color: #B00710;
-                transform: translateY(0px);
             }
         """)
         refresh_home_btn.clicked.connect(lambda: self.close_settings_and_refresh(settings_dialog, "home"))
@@ -6708,15 +8136,59 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             QPushButton:hover {
                 background-color: #3D3D3D;
                 border-color: #555555;
-                transform: translateY(-1px);
             }
             QPushButton:pressed {
                 background-color: #1D1D1D;
-                transform: translateY(0px);
             }
         """)
         refresh_all_btn.clicked.connect(lambda: self.close_settings_and_refresh(settings_dialog, "all"))
         refresh_layout.addWidget(refresh_all_btn)
+        
+        # Add duplicate checker button
+        duplicate_check_btn = QPushButton("🔍 Find & Remove Duplicates")
+        duplicate_check_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF8C00;
+                color: white;
+                border: none;
+                padding: 14px 20px;
+                font-size: 14px;
+                border-radius: 8px;
+                font-weight: 600;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #FF9500;
+            }
+            QPushButton:pressed {
+                background-color: #E67E00;
+            }
+        """)
+        duplicate_check_btn.clicked.connect(lambda: self.close_settings_and_find_duplicates(settings_dialog))
+        refresh_layout.addWidget(duplicate_check_btn)
+        
+        # Add automatic duplicate removal button
+        auto_remove_btn = QPushButton("🚀 Auto-Remove Duplicates (Keep Largest)")
+        auto_remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                border: none;
+                padding: 14px 20px;
+                font-size: 14px;
+                border-radius: 8px;
+                font-weight: 600;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #AB47BC;
+            }
+            QPushButton:pressed {
+                background-color: #8E24AA;
+            }
+        """)
+        auto_remove_btn.clicked.connect(lambda: self.close_settings_and_auto_remove(settings_dialog))
+        refresh_layout.addWidget(auto_remove_btn)
         
         # Enhanced description with tips
         refresh_description = QLabel("""
@@ -6724,6 +8196,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 <b style='color: #FFFFFF;'>💡 Tips:</b><br/>
 • <b>Refresh Home:</b> Updates movie/TV recommendations with fresh content<br/>
 • <b>Refresh All:</b> Clears cache and reloads all media libraries<br/>
+• <b>Find Duplicates:</b> Manually review and remove duplicate movies and series<br/>
+• <b>Auto-Remove:</b> Automatically removes duplicates (keeps largest files)<br/>
 • <b>Auto-refresh:</b> Home content refreshes automatically every 10 minutes
 </div>
         """)
@@ -6978,11 +8452,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             }}
             QPushButton:hover {{
                 background-color: {color}CC;
-                transform: translateY(-1px);
             }}
             QPushButton:pressed {{
                 background-color: {color}AA;
-                transform: translateY(0px);
             }}
         """
 
@@ -6993,6 +8465,114 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             self.reload_home_content()
         elif refresh_type == "all":
             self.refresh_all()
+
+    def close_settings_and_find_duplicates(self, dialog):
+        """Close settings dialog and find duplicates"""
+        dialog.close()
+        QTimer.singleShot(100, self.comprehensive_duplicate_check)  # Run comprehensive check
+
+    def close_settings_and_auto_remove(self, dialog):
+        """Close settings dialog and automatically remove duplicates"""
+        dialog.close()
+        QTimer.singleShot(100, self.auto_remove_duplicates_with_confirmation)
+
+    def auto_remove_duplicates_with_confirmation(self):
+        """Auto-remove duplicates with user confirmation"""
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Question)
+        msg.setText("This will automatically remove duplicate files, keeping the largest copy of each.")
+        msg.setInformativeText("This action cannot be undone. Continue?")
+        msg.setWindowTitle("Auto-Remove Duplicates")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #141414;
+            }
+            QMessageBox QLabel {
+                color: white;
+            }
+            QMessageBox QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        
+        if msg.exec_() == QMessageBox.Yes:
+            removed_count, message = self.auto_remove_duplicates(keep_largest=True)
+            
+            # Show results
+            result_msg = QMessageBox()
+            if removed_count > 0:
+                result_msg.setIcon(QMessageBox.Information)
+                result_msg.setText(f"Auto-removal complete!")
+                result_msg.setInformativeText(message)
+            else:
+                result_msg.setIcon(QMessageBox.Information)
+                result_msg.setText("No duplicates found")
+                result_msg.setInformativeText(message)
+            
+            result_msg.setWindowTitle("Duplicate Removal Results")
+            result_msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #141414;
+                }
+                QMessageBox QLabel {
+                    color: white;
+                }
+                QMessageBox QPushButton {
+                    background-color: #E50914;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    font-size: 14px;
+                    border-radius: 4px;
+                }
+            """)
+            result_msg.exec_()
+
+    def comprehensive_duplicate_check(self):
+        """Run a comprehensive duplicate check including files and cache"""
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Question)
+        msg.setText("This will scan your entire media library for duplicates and clean cache files.")
+        msg.setInformativeText("This process may take a few minutes. Continue?")
+        msg.setWindowTitle("Comprehensive Duplicate Check")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #141414;
+            }
+            QMessageBox QLabel {
+                color: white;
+            }
+            QMessageBox QPushButton {
+                background-color: #E50914;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                font-size: 14px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #F40612;
+            }
+        """)
+        
+        ret = msg.exec_()
+        if ret == QMessageBox.Yes:
+            # First clean cache duplicates
+            self.clean_cache_duplicates()
+            # Then check for media duplicates
+            QTimer.singleShot(500, self.find_and_remove_duplicates)
 
     def save_settings_and_close(self, dialog):
         """Save settings and close dialog"""
@@ -7075,12 +8655,23 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    if not os.path.exists(movies_folder):
-        os.makedirs(movies_folder)
-    if not os.path.exists(series_folder):
-        os.makedirs(series_folder)
-    os.makedirs(POSTER_CACHE_DIR, exist_ok=True)
-    os.makedirs(SYNOPSIS_CACHE_DIR, exist_ok=True)
-    window = MediaOrganizerApp()
-    window.show()
-    sys.exit(app.exec_())   
+    try:
+        check_tmdb_api_key()
+        if not os.path.exists(movies_folder):
+            os.makedirs(movies_folder)
+        if not os.path.exists(series_folder):
+            os.makedirs(series_folder)
+        os.makedirs(POSTER_CACHE_DIR, exist_ok=True)
+        os.makedirs(SYNOPSIS_CACHE_DIR, exist_ok=True)
+        
+        # Log startup info including duplicate prevention
+        logging.info("Starting Mediaflix with enhanced duplicate prevention...")
+        logging.info("Duplicate detection enabled for movies, series, and episodes")
+        
+        window = MediaOrganizerApp()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        show_critical_error(f"A fatal error occurred: {e}", tb_str)
+        sys.exit(1)
