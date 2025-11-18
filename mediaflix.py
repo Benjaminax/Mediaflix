@@ -7,6 +7,7 @@ import time
 import sys
 import requests
 from urllib.parse import quote
+from watch_status import WatchStatusManager
 from io import BytesIO
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -47,6 +48,8 @@ from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QPainter, QFont
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import json
+from pathlib import Path
 
 # Dynamically get the user's home directory
 home_directory = os.path.expanduser("~")
@@ -120,6 +123,27 @@ def extract_series_info(filename):
     
     return series_name, f"Season {season_num}", year
 
+
+def _cleanup_cache_variants(cache_dir, base_keyword, keep_filename=None):
+    """Remove cache files in cache_dir that match base_keyword but are not keep_filename.
+    base_keyword should be a lowercase substring to match against filenames.
+    """
+    try:
+        if not os.path.isdir(cache_dir):
+            return
+        for fname in os.listdir(cache_dir):
+            low = fname.lower()
+            if base_keyword.lower() in low:
+                if keep_filename and os.path.basename(keep_filename) == fname:
+                    continue
+                # remove old variant
+                try:
+                    os.remove(os.path.join(cache_dir, fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 class CacheClearThread(QThread):
     finished = pyqtSignal()
     def run(self):
@@ -160,8 +184,19 @@ class ImageItem(QListWidgetItem):
         self.load_data_async()
 
     def extract_movie_title(self, name):
+        # Normalize separators
         clean = name.replace('.', ' ').replace('_', ' ')
-        match = re.search(r'(19|20)\d{2}', clean)
+
+        # If filename has a numeric token before a year (e.g. "Title.2.2023"),
+        # keep that numeric token so the title becomes "Title 2" while the year
+        # is still removed below.
+        try:
+            if re.search(r'[\._\-]\d+[\._\-](19|20)\d{2}', name):
+                clean = re.sub(r'[\._\-](\d+)[\._\-](19|20)\d{2}', r' \1 \2', clean)
+        except Exception:
+            pass
+
+        match = re.search(r'\b(19|20)\d{2}\b', clean)
         if match:
             return clean[:match.start()].strip()
         return clean.strip()
@@ -199,12 +234,20 @@ class ImageItem(QListWidgetItem):
 
     def load_data_async(self):
         """Load both poster and metadata in parallel"""
-        self.load_poster()
-        self.load_metadata()
+        # Run poster and metadata loads in background threads to avoid blocking the UI
+        try:
+            threading.Thread(target=self.load_poster, daemon=True).start()
+            threading.Thread(target=self.load_metadata, daemon=True).start()
+        except Exception:
+            # Fallback to synchronous if threading fails for some reason
+            self.load_poster()
+            self.load_metadata()
 
     def load_poster(self):
         try:
             cache_name = f"{self.search_title}"
+            # If this file is an episode, include season/episode in cache name to avoid colliding with series-level metadata
+            ep_match = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name) or re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', self.file_name)
             if self.search_year:
                 cache_name += f" {self.search_year}"
             cache_file = f"{quote(cache_name)}.jpg"
@@ -240,38 +283,150 @@ class ImageItem(QListWidgetItem):
                     return
 
             # Fetch from TMDB
-            params = {"api_key": TMDB_API_KEY, "query": self.search_title}
-            params["region"] = "US"
-            if self.search_year:
-                params["year"] = self.search_year
+            # Detect if this is a TV episode by filename patterns like S01E02 or 1x02
+            ep_match = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name) or re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', self.file_name)
+            is_episode = bool(ep_match)
 
-            search_url = f"{TMDB_API_URL}/search/multi"
-            response = requests.get(search_url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            if is_episode:
+                # Parse season and episode numbers
+                try:
+                    if re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name):
+                        m = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name)
+                    else:
+                        m = re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', self.file_name)
+                    season_num = int(m.group(1))
+                    episode_num = int(m.group(2))
+                except Exception:
+                    season_num = None
+                    episode_num = None
 
-            poster_path = None
-            for result in data.get("results", []):
-                result_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
-                if self.search_year and result_year == self.search_year:
-                    poster_path = result.get("poster_path") or result.get("backdrop_path")
-                    if poster_path:
-                        break
-            if not poster_path:
+                # Derive a cleaned series-only title for searching: remove episode tokens
+                # and any trailing release-group-like tokens so TMDB matches the series name.
+                # Example: "Forever.2025.S01E01.YouthTrendx" -> "Forever"
+                series_search_raw = re.sub(r'[\._\-]?[sS]\d{1,2}[eE]\d{1,2}.*', '', os.path.splitext(self.file_name)[0])
+                # Replace separators and strip year if present
+                series_search = series_search_raw.replace('.', ' ').replace('_', ' ')
+                # Remove year token from series search
+                series_search = re.sub(r'\b(19|20)\d{2}\b', '', series_search).strip()
+
+                params = {"api_key": TMDB_API_KEY, "query": series_search}
+                params["region"] = "US"
+                search_url = f"{TMDB_API_URL}/search/tv"
+                response = requests.get(search_url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                results = data.get("results", [])
+                best_result = None
+                year_str = str(self.search_year) if self.search_year else None
+
+                # Prefer exact year matches first (if year present), try to match title within them
+                if year_str:
+                    year_matches = [r for r in results if (r.get("first_air_date", "")[:4]) == year_str]
+                    if year_matches:
+                        # Try case-insensitive exact title match within year matches
+                        for r in year_matches:
+                            if r.get('name', '').lower() == series_search.lower():
+                                best_result = r
+                                break
+                        # Try contains/partial match within year matches
+                        if not best_result:
+                            for r in year_matches:
+                                name_l = r.get('name', '').lower()
+                                s_l = series_search.lower()
+                                if s_l in name_l or name_l in s_l:
+                                    best_result = r
+                                    break
+                        # If still not found, pick the first year match
+                        if not best_result:
+                            best_result = year_matches[0]
+
+                # Next prefer case-insensitive exact title across all results
+                if not best_result:
+                    for r in results:
+                        if r.get('name', '').lower() == series_search.lower():
+                            best_result = r
+                            break
+
+                # Finally fallback to first result
+                if not best_result and results:
+                    best_result = results[0]
+
+                poster_path = None
+                # If we have a TV id and season/episode numbers, fetch episode data
+                if best_result and season_num and episode_num:
+                    tv_id = best_result.get('id')
+                    try:
+                        ep_url = f"{TMDB_API_URL}/tv/{tv_id}/season/{season_num}/episode/{episode_num}"
+                        ep_resp = requests.get(ep_url, params={"api_key": TMDB_API_KEY}, timeout=10)
+                        if ep_resp.status_code == 200:
+                            ep_data = ep_resp.json()
+                            # Episode still is preferred for episode image
+                            poster_path = ep_data.get('still_path') or ep_data.get('still_path') or best_result.get('poster_path') or best_result.get('backdrop_path')
+                    except Exception:
+                        poster_path = best_result.get('poster_path') or best_result.get('backdrop_path')
+                else:
+                    if best_result:
+                        poster_path = best_result.get('poster_path') or best_result.get('backdrop_path')
+
+                # Save and set poster if found (episode-level preferred)
+                if poster_path:
+                    image_url = f"{TMDB_IMAGE_URL}{poster_path}"
+                    image_data = requests.get(image_url, timeout=10).content
+                    with open(cache_path, "wb") as f:
+                        f.write(image_data)
+                    # Remove other poster variants for this title to avoid stale older-year images
+                    try:
+                        base_key = quote(self.search_title).lower()
+                        _cleanup_cache_variants(POSTER_CACHE_DIR, base_key, os.path.basename(cache_path))
+                    except Exception:
+                        pass
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(image_data)
+                    if not pixmap.isNull():
+                        self.setIcon(QIcon(self._apply_poster_overlay(pixmap)))
+
+            else:
+                # Default behavior for movies/other media: include year in search if available
+                params = {"api_key": TMDB_API_KEY, "query": self.search_title}
+                params["region"] = "US"
+                if self.search_year:
+                    params["year"] = self.search_year
+
+                search_url = f"{TMDB_API_URL}/search/multi"
+                response = requests.get(search_url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                poster_path = None
                 for result in data.get("results", []):
-                    poster_path = result.get("poster_path") or result.get("backdrop_path")
-                    if poster_path:
-                        break
+                    result_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
+                    if self.search_year and result_year == self.search_year:
+                        poster_path = result.get("poster_path") or result.get("backdrop_path")
+                        if poster_path:
+                            break
+                if not poster_path:
+                    for result in data.get("results", []):
+                        poster_path = result.get("poster_path") or result.get("backdrop_path")
+                        if poster_path:
+                            break
 
-            if poster_path:
-                image_url = f"{TMDB_IMAGE_URL}{poster_path}"
-                image_data = requests.get(image_url, timeout=10).content
-                with open(cache_path, "wb") as f:
-                    f.write(image_data)
-                pixmap = QPixmap()
-                pixmap.loadFromData(image_data)
-                if not pixmap.isNull():
-                    self.setIcon(QIcon(self._apply_poster_overlay(pixmap)))
+                if poster_path:
+                    image_url = f"{TMDB_IMAGE_URL}{poster_path}"
+                    image_data = requests.get(image_url, timeout=10).content
+                    with open(cache_path, "wb") as f:
+                        f.write(image_data)
+                    # Cleanup old variants for series (different years, etc.)
+                    try:
+                        base_key = quote(self.search_title).lower()
+                        _cleanup_cache_variants(POSTER_CACHE_DIR, base_key, os.path.basename(cache_path))
+                    except Exception:
+                        pass
+
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(image_data)
+                    if not pixmap.isNull():
+                        self.setIcon(QIcon(self._apply_poster_overlay(pixmap)))
         except Exception as e:
             logging.error(f"Error loading image for {self.display_name}: {str(e)}")
 
@@ -313,39 +468,130 @@ class ImageItem(QListWidgetItem):
                             self.release_year = meta[2] if meta[2] else self.search_year
                 return
 
-            params = {"api_key": TMDB_API_KEY, "query": self.search_title}
-            if self.search_year:
-                params["year"] = self.search_year
-
-            search_url = f"{TMDB_API_URL}/search/multi"
-            response = requests.get(search_url, params=params)
-            response.raise_for_status()
-            data = response.json()
+            # Detect episodes in filename and handle episode-level metadata
+            ep_match = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name) or re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', self.file_name)
+            is_episode = bool(ep_match)
 
             overview = ""
             imdb_rating = None
             genres = []
             release_year = self.search_year
 
-            for result in data.get("results", []):
-                result_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
-                if self.search_year and result_year == self.search_year:
-                    overview = result.get("overview", "")
-                    imdb_rating = result.get("vote_average", None)
-                    if "genre_ids" in result:
-                        genres = [str(gid) for gid in result["genre_ids"]]
-                    release_year = result_year
-                    if overview:
-                        break
-            if not overview:
+            if is_episode:
+                # Parse season and episode
+                try:
+                    if re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name):
+                        m = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', self.file_name)
+                    else:
+                        m = re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', self.file_name)
+                    season_num = int(m.group(1))
+                    episode_num = int(m.group(2))
+                except Exception:
+                    season_num = None
+                    episode_num = None
+
+                # Derive cleaned series search title (remove episode and trailing tokens)
+                series_search_raw = re.sub(r'[\._\-]?[sS]\d{1,2}[eE]\d{1,2}.*', '', os.path.splitext(self.file_name)[0])
+                series_search = series_search_raw.replace('.', ' ').replace('_', ' ')
+                series_search = re.sub(r'\b(19|20)\d{2}\b', '', series_search).strip()
+
+                # Search TV series to get tv_id and genres
+                params = {"api_key": TMDB_API_KEY, "query": series_search}
+                params["region"] = "US"
+                search_url = f"{TMDB_API_URL}/search/tv"
+                response = requests.get(search_url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                results = data.get("results", [])
+                best_result = None
+                year_str = str(self.search_year) if self.search_year else None
+
+                # Prefer exact year matches first (if year present), try to match title within them
+                if year_str:
+                    year_matches = [r for r in results if (r.get("first_air_date", "")[:4]) == year_str]
+                    if year_matches:
+                        # Try case-insensitive exact title match within year matches
+                        for r in year_matches:
+                            if r.get('name', '').lower() == series_search.lower():
+                                best_result = r
+                                break
+                        # Try contains/partial match within year matches
+                        if not best_result:
+                            for r in year_matches:
+                                name_l = r.get('name', '').lower()
+                                s_l = series_search.lower()
+                                if s_l in name_l or name_l in s_l:
+                                    best_result = r
+                                    break
+                        # If still not found, pick the first year match
+                        if not best_result:
+                            best_result = year_matches[0]
+
+                # Next prefer case-insensitive exact title across all results
+                if not best_result:
+                    for r in results:
+                        if r.get('name', '').lower() == series_search.lower():
+                            best_result = r
+                            break
+
+                # Finally fallback to first result
+                if not best_result and results:
+                    best_result = results[0]
+
+                if best_result:
+                    # Genres from series
+                    if "genre_ids" in best_result:
+                        genres = [str(gid) for gid in best_result["genre_ids"]]
+
+                    tv_id = best_result.get('id')
+                    if tv_id and season_num and episode_num:
+                        try:
+                            ep_url = f"{TMDB_API_URL}/tv/{tv_id}/season/{season_num}/episode/{episode_num}"
+                            ep_resp = requests.get(ep_url, params={"api_key": TMDB_API_KEY}, timeout=10)
+                            if ep_resp.status_code == 200:
+                                ep_data = ep_resp.json()
+                                overview = ep_data.get('overview', '')
+                                imdb_rating = ep_data.get('vote_average', None)
+                                release_year = (ep_data.get('air_date', '')[:4]) or release_year
+                        except Exception:
+                            pass
+
+                # If we still don't have overview, fall back to series overview
+                if not overview and best_result:
+                    overview = best_result.get('overview', '')
+                    release_year = release_year or (best_result.get('first_air_date', '')[:4])
+
+            else:
+                # Movie / general flow
+                params = {"api_key": TMDB_API_KEY, "query": self.search_title}
+                if self.search_year:
+                    params["year"] = self.search_year
+
+                search_url = f"{TMDB_API_URL}/search/multi"
+                response = requests.get(search_url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
                 for result in data.get("results", []):
-                    overview = result.get("overview", "")
-                    imdb_rating = result.get("vote_average", None)
-                    if "genre_ids" in result:
-                        genres = [str(gid) for gid in result["genre_ids"]]
-                    release_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
-                    if overview:
-                        break
+                    result_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
+                    if self.search_year and result_year == self.search_year:
+                        overview = result.get("overview", "")
+                        imdb_rating = result.get("vote_average", None)
+                        if "genre_ids" in result:
+                            genres = [str(gid) for gid in result["genre_ids"]]
+                        release_year = result_year
+                        if overview:
+                            break
+                if not overview:
+                    for result in data.get("results", []):
+                        overview = result.get("overview", "")
+                        imdb_rating = result.get("vote_average", None)
+                        if "genre_ids" in result:
+                            genres = [str(gid) for gid in result["genre_ids"]]
+                        release_year = result.get("release_date", "")[:4] or result.get("first_air_date", "")[:4]
+                        if overview:
+                            break
 
             genre_map = {
                 28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary",
@@ -651,7 +897,16 @@ class BackdropCachePreloader(QThread):
     def extract_movie_title(self, name):
         """Extract movie title by removing file extensions and year"""
         clean = name.replace('.', ' ').replace('_', ' ')
-        match = re.search(r'(19|20)\d{2}', clean)
+
+        # Preserve numeric token in patterns like "Title.2.2023" so the
+        # numeric part is kept as part of the title while the year is removed.
+        try:
+            if re.search(r'[\._\-]\d+[\._\-](19|20)\d{2}', name):
+                clean = re.sub(r'[\._\-](\d+)[\._\-](19|20)\d{2}', r' \1 \2', clean)
+        except Exception:
+            pass
+
+        match = re.search(r'\b(19|20)\d{2}\b', clean)
         if match:
             return clean[:match.start()].strip()
         return clean.strip()
@@ -685,6 +940,12 @@ class BackdropCachePreloader(QThread):
             
             if backdrop_path:
                 success = self.download_and_cache_backdrop(backdrop_path, cache_path)
+                # Cleanup other backdrop variants for this series title
+                try:
+                    base_key = safe_title.lower()
+                    _cleanup_cache_variants(BACKDROP_CACHE_DIR, base_key, os.path.basename(cache_path))
+                except Exception:
+                    pass
                 return success
                 
         except Exception as e:
@@ -703,21 +964,49 @@ class BackdropCachePreloader(QThread):
             if os.path.exists(cache_path):
                 return False  # Already cached, skip
             
-            # Search TMDB
+            # Search TMDB (do not include year in query; use year only to filter/select)
             params = {"api_key": TMDB_API_KEY, "query": series_name}
-            if year:
-                params["first_air_date_year"] = year
-            
             search_url = f"{TMDB_API_URL}/search/tv"
             response = requests.get(search_url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
-            
+
             backdrop_path = None
-            for result in data.get("results", [])[:1]:  # Just take first result
-                backdrop_path = result.get("backdrop_path")
-                if backdrop_path:
-                    break
+            results = data.get("results", [])
+            best_result = None
+            year_str = str(year) if year else None
+
+            # Prefer exact year matches first (if year provided), try to match title within them
+            if year_str:
+                year_matches = [r for r in results if (r.get("first_air_date", "")[:4]) == year_str]
+                if year_matches:
+                    for r in year_matches:
+                        if r.get('name', '').lower() == series_name.lower():
+                            best_result = r
+                            break
+                    if not best_result:
+                        for r in year_matches:
+                            name_l = r.get('name', '').lower()
+                            s_l = series_name.lower()
+                            if s_l in name_l or name_l in s_l:
+                                best_result = r
+                                break
+                    if not best_result:
+                        best_result = year_matches[0]
+
+            # Next prefer case-insensitive exact title across all results
+            if not best_result:
+                for r in results:
+                    if r.get('name', '').lower() == series_name.lower():
+                        best_result = r
+                        break
+
+            # Fallback: first result
+            if not best_result and results:
+                best_result = results[0]
+
+            if best_result:
+                backdrop_path = best_result.get("backdrop_path")
             
             if backdrop_path:
                 success = self.download_and_cache_backdrop(backdrop_path, cache_path)
@@ -738,6 +1027,14 @@ class BackdropCachePreloader(QThread):
                 # Save directly to file
                 with open(cache_path, 'wb') as f:
                     f.write(response.content)
+                # Cleanup other backdrop variants with same base name
+                try:
+                    base = os.path.splitext(os.path.basename(cache_path))[0]
+                    # base may include tv_<safe_title>_YEAR or similar; use first token
+                    base_key = base.split('_')[0] if '_' in base else base
+                    _cleanup_cache_variants(BACKDROP_CACHE_DIR, base_key, os.path.basename(cache_path))
+                except Exception:
+                    pass
                 return True
                     
         except Exception as e:
@@ -957,6 +1254,9 @@ class MediaOrganizerApp(QMainWindow):
         # Set minimum size and initial size, but allow full resizing
         self.setMinimumSize(800, 600)  # Minimum usable size
         self.resize(1200, 800)  # Initial size
+
+        # Initialize watch status manager
+        self.watch_status_manager = WatchStatusManager()
         
         self.current_season = None
         self.active_tab = None  # Track the active tab
@@ -989,9 +1289,62 @@ class MediaOrganizerApp(QMainWindow):
         self.backdrop_preloader.progress_updated.connect(self.on_cache_progress_updated)
         self.backdrop_preloader.cache_completed.connect(self.on_cache_completed)
         
-        # self.load_custom_fonts()  # Disabled for EXE stability
+        # Load user settings and (optionally) bundled fonts, then apply rendering optimizations
+        try:
+            self.user_settings = self.load_user_settings()
+        except Exception:
+            logging.exception("load_user_settings failed")
+            self.user_settings = {'use_bundled_fonts': True}
+
+        # Log loaded user settings for diagnostics
+        try:
+            logging.info(f"Loaded user settings: {self.user_settings}")
+        except Exception:
+            pass
+
+        try:
+            if self.user_settings.get('use_bundled_fonts', True):
+                self.load_custom_fonts()
+        except Exception:
+            logging.exception("load_custom_fonts failed")
         self.set_dark_theme()
-        # self.optimize_font_rendering()  # Disabled for EXE stability
+        # Apply runtime optimizations (best-effort)
+        try:
+            self.optimize_font_rendering()
+        except Exception:
+            logging.exception("optimize_font_rendering failed")
+        # In-memory caches to reduce repeated TMDB API calls and disk scans during a session
+        # These caches are intentionally in-memory (per-run) to avoid complex invalidation logic.
+        self.tmdb_response_cache = {}
+        self.disk_scan_cache = {}
+        # Provider ID cache and provider settings (persisted via user_settings)
+        # Load an on-disk provider cache to speed up provider ID resolution across runs
+        self.provider_id_cache = {}
+        try:
+            self.provider_cache_file = os.path.join(home_directory, ".media_organizer_provider_cache.json")
+            if os.path.exists(self.provider_cache_file):
+                try:
+                    with open(self.provider_cache_file, 'r', encoding='utf-8') as pf:
+                        data = json.load(pf)
+                        if isinstance(data, dict):
+                            # keep None values and numeric ids
+                            self.provider_id_cache = {k: (None if v is None else int(v)) for k, v in data.items()}
+                except Exception:
+                    logging.debug("Failed to load provider cache file; starting with empty cache")
+        except Exception:
+            # Fallback to simple in-memory cache if file operations fail
+            self.provider_cache_file = None
+        # Ensure user settings include provider preferences
+        # Default enabled providers and region if not present in loaded settings
+        default_providers = ["Netflix", "Hulu", "Apple TV+", "Prime Video", "The CW"]
+        try:
+            # self.user_settings was set above by load_user_settings()
+            self.user_settings.setdefault('enabled_providers', default_providers)
+            self.user_settings.setdefault('provider_region', 'US')
+        except Exception:
+            self.user_settings = {'use_bundled_fonts': True, 'enabled_providers': default_providers, 'provider_region': 'US'}
+        self.enabled_providers = list(self.user_settings.get('enabled_providers', default_providers))
+        self.provider_region = self.user_settings.get('provider_region', 'US')
         
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
@@ -1042,8 +1395,62 @@ class MediaOrganizerApp(QMainWindow):
                     QTimer.singleShot(10, lambda w=widget: self.resize_banner(w, None))
     
     def load_custom_fonts(self):
-        # Disabled custom font loading for EXE stability
-        pass
+        # Load bundled NetflixSans fonts from assets and register them with Qt
+        try:
+            # Respect user preference if available
+            if hasattr(self, 'user_settings') and not self.user_settings.get('use_bundled_fonts', True):
+                logging.info("User preference set to not use bundled fonts; skipping font registration")
+                return
+
+            font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
+            if os.path.isdir(font_dir):
+                loaded = []
+                for fname in os.listdir(font_dir):
+                    if fname.lower().endswith(('.ttf', '.otf')):
+                        path = os.path.join(font_dir, fname)
+                        id_ = QFontDatabase.addApplicationFont(path)
+                        if id_ != -1:
+                            families = QFontDatabase.applicationFontFamilies(id_)
+                            loaded.extend(families)
+                if loaded:
+                    # Prefer the custom Netflix Sans family if available
+                    app_font = self.create_crisp_font("Netflix Sans Regular", 12)
+                    QApplication.setFont(app_font)
+                    logging.info(f"Loaded custom fonts: {loaded}")
+                else:
+                    logging.info("No custom fonts were loaded (none found or failed to register)")
+            else:
+                logging.info(f"Font directory not found: {font_dir}")
+        except Exception as e:
+            logging.error(f"Error loading custom fonts: {e}")
+
+    def load_user_settings(self):
+        """Load user settings from a JSON file in the user's home directory."""
+        settings_path = os.path.join(home_directory, ".media_organizer_settings.json")
+        try:
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {'use_bundled_fonts': True}
+        except Exception as e:
+            logging.error(f"Failed to load user settings: {e}")
+        return {'use_bundled_fonts': True}
+
+    def save_user_settings(self):
+        """Persist user settings to a JSON file in the user's home directory."""
+        settings_path = os.path.join(home_directory, ".media_organizer_settings.json")
+        try:
+            # Ensure provider preferences are persisted
+            try:
+                self.user_settings['enabled_providers'] = list(self.enabled_providers)
+                self.user_settings['provider_region'] = self.provider_region
+            except Exception:
+                pass
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self.user_settings, f, indent=2)
+            logging.info(f"Saved user settings to {settings_path}")
+        except Exception as e:
+            logging.error(f"Failed to save user settings: {e}")
 
     def set_dark_theme(self):
         dark_palette = QPalette()
@@ -1168,8 +1575,23 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         return font
 
     def optimize_font_rendering(self):
-        # Disabled font rendering optimization for EXE stability
-        pass
+        # Try to enable high-DPI pixmaps and improved font rendering where possible
+        try:
+            # Enable high DPI scaling and high DPI pixmaps for crisper rendering on modern displays
+            try:
+                QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+                QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+            except Exception:
+                # Some PyQt versions may not support these attributes at runtime
+                pass
+
+            # Create and set a crisp default application font
+            crisp = self.create_crisp_font("Netflix Sans Regular", 12)
+            QApplication.setFont(crisp)
+
+            logging.info("Applied font rendering optimizations")
+        except Exception as e:
+            logging.error(f"Error optimizing font rendering: {e}")
 
     def create_netflix_icon(self):
         pixmap = QPixmap(64, 64)
@@ -1222,6 +1644,14 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         # Remove release group tags (usually at the end after a dash)
         clean = re.sub(r'-[A-Za-z0-9]+$', '', clean)
         
+        # If filename has a numeric token before a year (e.g. "Title.2.2023"), keep that numeric token
+        # so the title becomes "Title 2" and the year is still removed.
+        try:
+            if re.search(r'[\._\-]\d+[\._\-](19|20)\d{2}', name):
+                clean = re.sub(r'[\._\-](\d+)[\._\-](19|20)\d{2}', r' \1 \2', clean)
+        except Exception:
+            pass
+
         # Remove year (but keep track of it)
         year_match = re.search(r'\b(19|20)\d{2}\b', clean)
         if year_match:
@@ -1503,9 +1933,13 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 timeout=5
             )
             if response.status_code == 200:
-                # Internet is available, start backdrop caching immediately
-                logging.info("Internet detected - starting immediate backdrop cache preload")
-                self.start_backdrop_cache_preload()
+                # Internet is available. Only start backdrop caching if no cached backdrops exist.
+                cached_count = self.get_cached_backdrop_count()
+                if cached_count > 0:
+                    logging.info(f"Internet detected - {cached_count} backdrops already cached, skipping automatic preload")
+                else:
+                    logging.info("Internet detected - starting immediate backdrop cache preload")
+                    self.start_backdrop_cache_preload()
             else:
                 # Retry after 5 seconds
                 logging.info(f"Internet check failed (status {response.status_code}) - retrying in 5 seconds")
@@ -2422,9 +2856,28 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         # Get current filter (default to "movie" if not set)
         current_filter = getattr(self, 'current_content_filter', 'movie')
         
-        # Netflix-style genre names with engaging descriptions
+        # Show Trending row first (movies or series) for immediate discovery
+        if current_filter == "movie":
+            trending_widget = self.create_fast_genre_row("🔥 Trending Now", "trending", content_type="movie")
+        else:
+            trending_widget = self.create_fast_genre_row("🔥 Trending Series", "trending", content_type="tv")
+        if trending_widget:
+            parent_layout.addWidget(trending_widget)
+
+        # Add streaming-provider based rows next
+        # Use enabled providers from user settings (falls back to default list)
+        provider_names = list(self.user_settings.get('enabled_providers', ["Netflix", "Hulu", "Apple TV+", "Prime Video", "The CW"]))
+        # Insert provider-based sections after trending for discoverability
+        for provider in provider_names:
+            try:
+                provider_widget = self.create_provider_row(f"Streaming on {provider}", provider, content_type=current_filter)
+                if provider_widget:
+                    parent_layout.addWidget(provider_widget)
+            except Exception:
+                logging.debug(f"Provider row skipped for {provider}")
+        
+        # Movie genre rows with friendly titles (trending handled above)
         movie_genres = [
-            ("🔥 Trending Now", "trending"),  # Use "trending" instead of genre ID
             ("💥 Explosive Action", 28),
             ("😂 Laugh Out Loud", 35),
             ("🎭 Award-Winning Dramas", 18),
@@ -2433,59 +2886,26 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             ("💕 Romance & Love Stories", 10749),
             ("🔪 Edge-of-Your-Seat Thrillers", 53),
             ("🎨 Animated Masterpieces", 16),
-            ("🗺️ Epic Adventures", 12),
-            ("🔫 Crime & Heists", 80),
-            ("🐉 Fantasy Worlds", 14),
-            ("🕵️ Mystery & Detective", 9648),
-            ("⚔️ War & Combat", 10752),
-            ("🤠 Wild West", 37),
-            ("📚 True Stories", 99),
-            ("👨‍👩‍👧‍👦 Family Fun", 10751),
-            ("🎵 Music & Musicals", 10402),
-            ("🏛️ Historical Epics", 36)
+            ("🗺️ Epic Adventures", 12)
         ]
         
-        # TV Series genres - All standard TMDB TV genres
+        # TV Series genres - simplified priority list (trending handled above)
         tv_genres = [
-            ("🔥 Trending Series", "trending"),  # Use "trending" instead of genre ID
-            ("💖 Romance & Love Stories", 10749),  # Romance (using movie genre ID as TV doesn't have dedicated romance)
-            ("😱 Horror & Supernatural", 27),  # Horror (using movie genre ID)
-            ("🎵 Music & Musicals", 10402),  # Music (using movie genre ID)
-            ("⚡ Action & Adventure", 10759),  # Action & Adventure
-            ("🎭 Animation", 16),  # Animation
-            ("😄 Comedy", 35),  # Comedy
-            ("🚔 Crime", 80),  # Crime
-            ("📚 Documentary", 99),  # Documentary
-            ("🎬 Drama", 18),  # Drama
-            ("👨‍👩‍👧‍👦 Family", 10751),  # Family
-            ("👶 Kids", 10762),  # Kids
-            ("🔍 Mystery", 9648),  # Mystery
-            ("📺 Reality", 10764),  # Reality
-            ("🌌 Sci-Fi & Fantasy", 10765),  # Sci-Fi & Fantasy
-            ("🧼 Soap", 10766),  # Soap
-            ("💬 Talk", 10767),  # Talk
-            ("⚔️ War & Politics", 10768),  # War & Politics
-            ("🤠 Western", 37),  # Western
-            ("🎪 Variety Show", 10767),  # Using Talk genre for variety shows
-            ("🏥 Medical Drama", 18),  # Using Drama genre for medical shows
-            ("🎓 Educational", 99),  # Using Documentary for educational content
-            ("🎮 Game Show", 10764),  # Using Reality for game shows
-            ("🌍 Travel", 99),  # Using Documentary for travel shows
-            ("🍳 Cooking", 10764),  # Using Reality for cooking shows
-            ("🏠 Home & Garden", 10764),  # Using Reality for home improvement
-            ("🧠 Psychological Thriller", 9648)  # Using Mystery for psychological content
+            ("⚡ Action & Adventure", 10759),
+            ("😄 Comedy", 35),
+            ("🎭 Drama", 18),
+            ("🌌 Sci-Fi & Fantasy", 10765),
+            ("😱 Horror & Supernatural", 27),
+            ("🎵 Music & Musicals", 10402)
         ]
         
-        # Load more genres initially to show variety, then load remaining - optimized for speed
+        # Load prioritized genres first, then remaining after short delay for responsive UI
         if current_filter == "movie":
-            self.load_priority_genres(parent_layout, movie_genres[:4], "movie")  # Reduced from 6 to 4 for faster initial load
-            # Load remaining genres after a delay
+            self.load_priority_genres(parent_layout, movie_genres[:4], "movie")
             QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, movie_genres[4:], "movie"))
         elif current_filter == "tv":
-            # Prioritize Romance, Horror, and Music by loading them first (positions 1, 2, 3)
-            self.load_priority_genres(parent_layout, tv_genres[:7], "tv")  # Increased from 5 to 7 to include more priority genres
-            # Load remaining genres after a delay
-            QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, tv_genres[7:], "tv"))
+            self.load_priority_genres(parent_layout, tv_genres[:5], "tv")
+            QTimer.singleShot(500, lambda: self.load_remaining_genres(parent_layout, tv_genres[5:], "tv"))
 
     def load_priority_genres(self, parent_layout, genres, content_type):
         """Load priority genres immediately for faster initial display - optimized"""
@@ -2571,6 +2991,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         content_layout = QHBoxLayout(content_container)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(15)
+        content_layout.setAlignment(Qt.AlignLeft)
         
         # Load content for this genre based on type - with faster loading
         if content_type == "tv":
@@ -2583,6 +3004,242 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         genre_layout.addWidget(scroll_area)
         
         return genre_container
+
+    def get_provider_id(self, provider_name, content_type="movie", region="US"):
+        """Resolve a provider name to TMDB provider_id dynamically.
+        Returns provider_id integer or None if not found.
+        """
+        # Prefer cache first
+        try:
+            cache_key = f"{content_type}:{provider_name.lower()}:{region}"
+            if cache_key in self.provider_id_cache:
+                return self.provider_id_cache[cache_key]
+
+            # Use configured region if region not explicitly provided
+            if not region:
+                region = getattr(self, 'provider_region', 'US')
+
+            url = f"{TMDB_API_URL}/watch/providers/{content_type}"
+            resp = requests.get(url, params={"api_key": TMDB_API_KEY, "watch_region": region}, timeout=6)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", {})
+
+            providers = []
+            if isinstance(results, dict):
+                if region in results and isinstance(results[region], dict):
+                    providers = results[region].get("flatrate", []) or []
+                else:
+                    for v in results.values():
+                        if isinstance(v, dict) and "flatrate" in v:
+                            providers.extend(v.get("flatrate") or [])
+            elif isinstance(results, list):
+                providers = results
+
+            pname = provider_name.lower().replace('plus', '').replace('prime', 'prime').strip()
+            found_id = None
+            for p in providers:
+                name = (p.get("provider_name") or p.get("name") or "").lower()
+                if provider_name.lower() in name or pname in name:
+                    found_id = p.get("provider_id") or p.get("id")
+                    break
+
+            if not found_id:
+                for p in providers:
+                    name = (p.get("provider_name") or p.get("name") or "").lower()
+                    if any(tok in name for tok in provider_name.lower().split()):
+                        found_id = p.get("provider_id") or p.get("id")
+                        break
+
+            # Cache resolved id (including None to avoid repeated failed lookups for a while)
+            self.provider_id_cache[cache_key] = found_id
+            try:
+                # Persist provider cache to disk for faster subsequent startups
+                if getattr(self, 'provider_cache_file', None):
+                    with open(self.provider_cache_file, 'w', encoding='utf-8') as pf:
+                        json.dump(self.provider_id_cache, pf, indent=2)
+            except Exception:
+                logging.debug("Failed to persist provider cache")
+            return found_id
+        except Exception as e:
+            logging.debug(f"Provider lookup failed for {provider_name}: {e}")
+            # Cache failure as None to avoid hammering API repeatedly
+            try:
+                self.provider_id_cache[cache_key] = None
+                if getattr(self, 'provider_cache_file', None):
+                    try:
+                        with open(self.provider_cache_file, 'w', encoding='utf-8') as pf:
+                            json.dump(self.provider_id_cache, pf, indent=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return None
+
+    def create_provider_row(self, title, provider_name, content_type="movie"):
+        """Create a horizontal row for a specific streaming provider using TMDB discover with_watch_providers."""
+        try:
+            provider_id = self.get_provider_id(provider_name, content_type=content_type)
+            if not provider_id:
+                logging.debug(f"Could not resolve provider id for {provider_name}")
+                return None
+
+            container = QWidget()
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(10)
+
+            # Title (match genre row style exactly)
+            title_label = QLabel(title)
+            title_label.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: 700; 
+            color: white;
+            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Segoe UI', 'Arial', sans-serif;
+            margin-bottom: 5px;
+            letter-spacing: -0.2px;
+            """)
+            genre_font = self.create_crisp_font("Netflix Sans Bold", 20, bold=True)
+            title_label.setFont(genre_font)
+            layout.addWidget(title_label)
+
+            # Horizontal scroll area
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(False)
+            scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll_area.setFixedHeight(280)
+            scroll_area.setStyleSheet("""
+                QScrollArea { border: none; background: transparent; }
+            """)
+
+            content_container = QWidget()
+            content_layout = QHBoxLayout(content_container)
+            content_layout.setContentsMargins(0, 0, 0, 0)
+            content_layout.setSpacing(15)
+
+            # Add a loading placeholder so UI matches genre rows immediately
+            loading_label = QLabel("Loading...")
+            loading_label.setStyleSheet("color: #666666; font-size: 14px; padding: 20px;")
+            loading_label.setAlignment(Qt.AlignCenter)
+            content_layout.addWidget(loading_label)
+
+            # Load provider content asynchronously (fill the content_layout when ready)
+            if content_type == "tv":
+                QTimer.singleShot(50, lambda: self._load_provider_content_replace_placeholder(content_layout, provider_id, content_type))
+            else:
+                QTimer.singleShot(50, lambda: self._load_provider_content_replace_placeholder(content_layout, provider_id, content_type))
+
+            content_layout.addStretch()
+            scroll_area.setWidget(content_container)
+            layout.addWidget(scroll_area)
+            return container
+        except Exception as e:
+            logging.debug(f"create_provider_row error: {e}")
+            return None
+
+    def load_provider_movies_fast(self, layout, provider_id, limit=20):
+        """Discover movies available on a provider (flatrate streaming) and populate layout"""
+        try:
+            params = {
+                "api_key": TMDB_API_KEY,
+                "with_watch_providers": provider_id,
+                "watch_region": "US",
+                "with_watch_monetization_types": "flatrate",
+                "sort_by": "popularity.desc",
+                "page": 1
+            }
+            url = f"{TMDB_API_URL}/discover/movie"
+            resp = requests.get(url, params=params, timeout=6)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:limit]
+            for i, movie in enumerate(results):
+                widget = self.create_home_movie_item_fast(movie)
+                layout.addWidget(widget)
+                if i % 5 == 0:
+                    QApplication.processEvents()
+
+            # Try to make the content container fit the posters (so horizontal scroll fits tightly)
+            try:
+                content_container = layout.parentWidget()
+                if content_container is not None:
+                    count = max(1, len(results))
+                    spacing = layout.spacing() or 15
+                    # Each poster widget is 140 width in create_home_movie_item_fast
+                    min_width = count * (140 + spacing) + 40
+                    content_container.setMinimumWidth(min_width)
+                    content_container.adjustSize()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.debug(f"Error loading provider movies {provider_id}: {e}")
+            placeholder = QLabel("No streaming results")
+            placeholder.setStyleSheet("color: #888; font-size: 12px; padding: 15px; background: #2a2a2a; border-radius: 8px; min-width:140px;")
+            placeholder.setAlignment(Qt.AlignCenter)
+            layout.addWidget(placeholder)
+
+    def load_provider_series_fast(self, layout, provider_id, limit=20):
+        """Discover TV shows available on a provider (flatrate streaming) and populate layout"""
+        try:
+            params = {
+                "api_key": TMDB_API_KEY,
+                "with_watch_providers": provider_id,
+                "watch_region": "US",
+                "with_watch_monetization_types": "flatrate",
+                "sort_by": "popularity.desc",
+                "page": 1
+            }
+            url = f"{TMDB_API_URL}/discover/tv"
+            resp = requests.get(url, params=params, timeout=6)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:limit]
+            for i, show in enumerate(results):
+                widget = self.create_home_series_item_fast(show)
+                layout.addWidget(widget)
+                if i % 5 == 0:
+                    QApplication.processEvents()
+
+            # Make the content container fit the posters for tight horizontal scrolling
+            try:
+                content_container = layout.parentWidget()
+                if content_container is not None:
+                    count = max(1, len(results))
+                    spacing = layout.spacing() or 15
+                    min_width = count * (140 + spacing) + 40
+                    content_container.setMinimumWidth(min_width)
+                    content_container.adjustSize()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.debug(f"Error loading provider series {provider_id}: {e}")
+            placeholder = QLabel("No streaming results")
+            placeholder.setStyleSheet("color: #888; font-size: 12px; padding: 15px; background: #2a2a2a; border-radius: 8px; min-width:140px;")
+            placeholder.setAlignment(Qt.AlignCenter)
+            layout.addWidget(placeholder)
+
+    def _load_provider_content_replace_placeholder(self, layout, provider_id, content_type="movie", limit=20):
+        """Helper: replace the initial placeholder in a provider row with actual poster widgets"""
+        try:
+            # Remove existing placeholder widgets (e.g., the "Loading..." label)
+            for i in reversed(range(layout.count())):
+                item = layout.itemAt(i)
+                if item and item.widget():
+                    w = item.widget()
+                    # Remove only initial placeholders (we check text content)
+                    try:
+                        if isinstance(w, QLabel) and w.text() in ("Loading...", "No streaming results"):
+                            w.setParent(None)
+                    except Exception:
+                        # For non-QLabel widgets, just continue
+                        pass
+
+            # Populate with provider content
+            if content_type == "tv":
+                self.load_provider_series_fast(layout, provider_id, limit=limit)
+            else:
+                self.load_provider_movies_fast(layout, provider_id, limit=limit)
+        except Exception as e:
+            logging.debug(f"_load_provider_content_replace_placeholder failed: {e}")
     
     def get_similar_content(self, content_id, content_type="movie", limit=10):
         """Get enhanced similar movies or TV series using multiple recommendation strategies"""
@@ -3639,6 +4296,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         content_layout = QHBoxLayout(content_container)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(15)
+        content_layout.setAlignment(Qt.AlignLeft)
         
         # Create items for similar content
         for item in similar_content:
@@ -3858,8 +4516,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         # Add loading placeholder initially
         loading_label = QLabel("Loading...")
         loading_label.setStyleSheet("color: #666666; font-size: 14px; padding: 20px;")
-        loading_label.setAlignment(Qt.AlignCenter)
-        content_layout.addWidget(loading_label)
+        loading_label.setAlignment(Qt.AlignLeft)
+        content_layout.addWidget(loading_label, alignment=Qt.AlignLeft)
         
         # Load content asynchronously with delay to prevent blocking
         QTimer.singleShot(50, lambda: self.load_genre_content_delayed(content_layout, genre_id, content_type))
@@ -5166,14 +5824,18 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def filter_media(self):
         search_text = self.search_bar.text().lower()
         filter_text = self.filter_combo.currentText()
-        
-        list_widget = self.movies_list if self.stacked_widget.currentIndex() == 0 else self.series_list
-            
+        # The Movies view uses self.movies_list. Don't rely on stacked_widget index
+        # because the stacked indices may differ; operate directly on the movies list
+        # if it's present. If not present, nothing to filter.
+        list_widget = getattr(self, 'movies_list', None)
+        if list_widget is None:
+            return
+
         for i in range(list_widget.count()):
             item = list_widget.item(i)
             matches_search = search_text in item.text().lower()
             matches_filter = (filter_text == "All" or 
-                            (hasattr(item, 'genres') and filter_text in item.genres))
+                              (hasattr(item, 'genres') and filter_text in item.genres))
             item.setHidden(not (matches_search and matches_filter))
     
     def create_series_list_view(self):
@@ -5516,287 +6178,261 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.stacked_widget.setCurrentIndex(2)
 
     def show_series_episodes(self, item):
-        self.previous_view_stack.append(("episodes", None))
-        series_path = item.data(Qt.UserRole)
-        if not series_path:
-            return
+        try:
+            # Replace the episodes view with a scrollable container that holds the entire screen
+            self.previous_view_stack.append(("episodes", None))
+            series_path = item.data(Qt.UserRole)
+            # remember currently displayed series for UI refreshes
+            self.current_series_data = series_path
+            if not series_path:
+                return
 
-        # Clear previous content
-        for i in reversed(range(self.episodes_layout.count())):
-            widget = self.episodes_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
+            # Build the page: fixed top area (back button + banner) and a scrollable lower section
+            page_widget = QWidget()
+            page_layout = QVBoxLayout(page_widget)
+            page_layout.setContentsMargins(20, 15, 20, 15)
+            page_layout.setSpacing(12)
 
-        # Back button
-        back_button = QPushButton("Back")
-        back_button.setStyleSheet("""
-            QPushButton {
-                background-color: #E50914;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                font-size: 14px;
-                border-radius: 4px;
-                max-width: 100px;
-            }
-            QPushButton:hover {
-                background-color: #F40612;
-            }
-        """)
-        back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
-        self.episodes_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+            # Back button (fixed)
+            back_button = QPushButton("Back")
+            back_button.setStyleSheet("""
+                QPushButton { background-color: #E50914; color: white; border: none; padding: 8px 16px; font-size: 14px; border-radius: 4px; max-width: 100px; }
+                QPushButton:hover { background-color: #F40612; }
+            """)
+            back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
+            page_layout.addWidget(back_button, alignment=Qt.AlignLeft)
 
-        # Banner with backdrop from TMDB or fallback to poster - cached version
-        backdrop_used = False
-        series_name = item.text()
-        backdrop_data = self.get_tmdb_series_backdrop(series_name)
-        
-        if backdrop_data:
-            backdrop_path = backdrop_data.get("backdrop_path")
-            if backdrop_path:
-                # Create banner label placeholder
+            # Banner with backdrop from TMDB or fallback to poster - cached version (fixed)
+            backdrop_used = False
+            series_name = item.text()
+            backdrop_data = self.get_tmdb_series_backdrop(series_name)
+
+            if backdrop_data:
+                backdrop_path = backdrop_data.get("backdrop_path")
+                if backdrop_path:
+                    banner_label = QLabel()
+                    banner_label.setFixedHeight(300)
+                    banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                    banner_label.setStyleSheet("QLabel { border-radius: 8px; background-color: #222; color: #666; font-size: 48px; text-align: center; }")
+                    banner_label.setAlignment(Qt.AlignCenter)
+                    banner_label.setText("📺")
+                    page_layout.addWidget(banner_label)
+                    self.load_backdrop_async(banner_label, backdrop_path, "📺", series_name)
+                    backdrop_used = True
+
+            if not backdrop_used:
                 banner_label = QLabel()
                 banner_label.setFixedHeight(300)
                 banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                banner_label.setStyleSheet("""
-                    QLabel {
-                        border-radius: 8px;
-                        background-color: #222;
-                        color: #666;
-                        font-size: 48px;
-                        text-align: center;
-                    }
-                """)
-                banner_label.setAlignment(Qt.AlignCenter)
-                banner_label.setText("📺")  # Placeholder while loading
-                self.episodes_layout.addWidget(banner_label)
-                
-                # Load backdrop asynchronously with caching
-                self.load_backdrop_async(banner_label, backdrop_path, "📺", series_name)
-                backdrop_used = True
-        
-        # Fallback to cached backdrop search or proper no-backdrop message if backdrop failed
-        if not backdrop_used:
-            banner_label = QLabel()
-            banner_label.setFixedHeight(300)  # Same height as backdrop banner
-            banner_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            
-            # Try to find cached backdrop for this series
-            cached_backdrop_found = False
+                cached_backdrop_found = False
+                try:
+                    safe_title = "".join(c for c in series_name if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
+                    possible_cache_names = [
+                        f"series_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                        f"tv_{safe_title}_Unknown.jpg".replace(' ', '_'),
+                        f"series_{safe_title}_no_year.jpg".replace(' ', '_'),
+                        f"tv_{safe_title}_no_year.jpg".replace(' ', '_'),
+                    ]
+                    for cache_name in possible_cache_names:
+                        cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_name)
+                        if os.path.exists(cache_path):
+                            cached_pixmap = QPixmap(cache_path)
+                            if not cached_pixmap.isNull():
+                                banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
+                                banner_label.setPixmap(banner)
+                                cached_backdrop_found = True
+                                break
+                except Exception as e:
+                    logging.error(f"Error loading cached backdrop for {series_name}: {str(e)}")
+
+                if not cached_backdrop_found:
+                    banner_label.setText("📺\n\nNo Backdrop Available\nBackdrops will load when online")
+                    banner_label.setStyleSheet("""
+                        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1a1a1a, stop:1 #2a2a2a);
+                        border-radius: 8px; border: 2px dashed #444; text-align: center; color: #888; font-size: 16px; padding: 20px; line-height: 1.4;
+                    """)
+                    banner_label.setAlignment(Qt.AlignCenter)
+                    banner_label.setWordWrap(True)
+
+                page_layout.addWidget(banner_label)
+
+            # Series info (moved into the lower scroll area)
+            info_widget = QWidget()
+            info_layout = QVBoxLayout(info_widget)
+            info_layout.setContentsMargins(10, 0, 10, 0)
+            title_label = QLabel(item.text())
+            title_label.setStyleSheet("font-size: 22px; font-weight: bold; color: white;")
+            info_layout.addWidget(title_label)
+
+            synopsis, imdb_rating, genres, year = self.get_series_synopsis(series_path, return_meta=True)
+            meta_parts = []
+            if year:
+                meta_parts.append(str(year))
+            if genres:
+                meta_parts.append(", ".join(genres))
+            if imdb_rating:
+                meta_parts.append(f"IMDb: ★ {imdb_rating:.1f}")
+            metadata_label = QLabel(" • ".join(meta_parts))
+            metadata_label.setStyleSheet("font-size: 14px; color: #AAAAAA;")
+            info_layout.addWidget(metadata_label)
+            synopsis_label = QLabel(synopsis if synopsis else "Synopsis not available")
+            synopsis_label.setWordWrap(True)
+            synopsis_label.setStyleSheet("font-size: 13px; color: #AAAAAA;")
+            info_layout.addWidget(synopsis_label)
+
+            # Now create a scroll area for the lower section (info, seasons, episodes)
+            lower_scroll = QScrollArea()
+            lower_scroll.setWidgetResizable(True)
+            lower_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+            lower_container = QWidget()
+            lower_layout = QVBoxLayout(lower_container)
+            lower_layout.setContentsMargins(0, 0, 0, 0)
+            lower_layout.setSpacing(12)
+
+            # Add info widget into lower layout
+            lower_layout.addWidget(info_widget)
+
+            # Seasons navigation
+            seasons = self.get_seasons_list(series_path)
+            if seasons:
+                seasons_widget = QWidget()
+                seasons_layout = QHBoxLayout(seasons_widget)
+                seasons_layout.setContentsMargins(0, 10, 0, 10)
+                seasons_layout.setSpacing(10)
+                seasons_label = QLabel("Seasons:")
+                seasons_label.setStyleSheet("font-size: 16px; color: white;")
+                seasons_layout.addWidget(seasons_label)
+                seasons_sorted = sorted(seasons, key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
+                for season in seasons_sorted:
+                    btn = QPushButton(season)
+                    btn.setStyleSheet("""
+                        QPushButton { background-color: #2D2D2D; color: white; border: none; padding: 5px 10px; border-radius: 4px; min-width: 80px; }
+                        QPushButton:hover { background-color: #3D3D3D; }
+                        QPushButton:pressed { background-color: #E50914; }
+                    """)
+                    # Use on_season_button_clicked so we can update only the episodes list
+                    btn.clicked.connect(lambda checked, s=season, sp=series_path: self.on_season_button_clicked(sp, s))
+                    seasons_layout.addWidget(btn)
+                seasons_layout.addStretch()
+                lower_layout.addWidget(seasons_widget)
+
+            # Episodes list title
+            episodes_title = QLabel("Episodes")
+            episodes_title.setStyleSheet("font-size: 18px; font-weight: bold; color: white; margin-top: 10px;")
+            lower_layout.addWidget(episodes_title)
+
+            # Episodes list container (scrollable)
+            episodes_container = QWidget()
+            episodes_list_layout = QVBoxLayout(episodes_container)
+            episodes_list_layout.setContentsMargins(0, 0, 0, 0)
+            episodes_list_layout.setSpacing(10)
+
+            # Show all episodes by default, or filter by season if selected
+            displayed_episodes = set()
+            episodes = self.get_episodes_for_series(series_path, season=self.current_season)
+
+            # Save references so season switches can update only the episodes list and preserve banner/metadata
             try:
-                safe_title = "".join(c for c in series_name if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
-                
-                # Try different cache filename formats
-                possible_cache_names = [
-                    f"series_{safe_title}_Unknown.jpg".replace(' ', '_'),
-                    f"tv_{safe_title}_Unknown.jpg".replace(' ', '_'),
-                    f"series_{safe_title}_no_year.jpg".replace(' ', '_'),
-                    f"tv_{safe_title}_no_year.jpg".replace(' ', '_'),
-                ]
-                
-                for cache_name in possible_cache_names:
-                    cache_path = os.path.join(BACKDROP_CACHE_DIR, cache_name)
-                    if os.path.exists(cache_path):
-                        cached_pixmap = QPixmap(cache_path)
-                        if not cached_pixmap.isNull():
-                            # Create proper banner with cached backdrop
-                            banner = self.create_poster_banner(cached_pixmap, width=900, height=300)
-                            banner_label.setPixmap(banner)
-                            cached_backdrop_found = True
-                            break
-                
-            except Exception as e:
-                logging.error(f"Error loading cached backdrop for {series_name}: {str(e)}")
-            
-            if not cached_backdrop_found:
-                # Show proper "no backdrop available" message instead of stretched poster
-                banner_label.setText("📺\n\nNo Backdrop Available\nBackdrops will load when online")
-                banner_label.setStyleSheet("""
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                        stop:0 #1a1a1a, stop:1 #2a2a2a);
-                    border-radius: 8px;
-                    border: 2px dashed #444;
-                    text-align: center;
-                    color: #888;
-                    font-size: 16px;
-                    font-family: 'Netflix Sans', 'Arial', sans-serif;
-                    padding: 20px;
-                    line-height: 1.4;
-                """)
-                banner_label.setAlignment(Qt.AlignCenter)
-                banner_label.setWordWrap(True)
-            
-            self.episodes_layout.addWidget(banner_label)
+                self.current_series_path_in_view = series_path
+                self.current_episodes_list_layout = episodes_list_layout
+            except Exception:
+                pass
 
-        # Series info
-        info_widget = QWidget()
-        info_layout = QVBoxLayout(info_widget)
-        info_layout.setContentsMargins(10, 0, 10, 0)
-        title_label = QLabel(item.text())
-        title_label.setStyleSheet("""
-            font-size: 22px; 
-            font-weight: bold; 
-            color: white;
-            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
-        """)
-        info_layout.addWidget(title_label)
-        
-        synopsis, imdb_rating, genres, year = self.get_series_synopsis(series_path, return_meta=True)
-        meta_parts = []
-        if year:
-            meta_parts.append(str(year))
-        if genres:
-            meta_parts.append(", ".join(genres))
-        if imdb_rating:
-            meta_parts.append(f"IMDb: ★ {imdb_rating:.1f}")
-        metadata_label = QLabel(" • ".join(meta_parts))
-        metadata_label.setStyleSheet("font-size: 14px; color: #AAAAAA;")
-        info_layout.addWidget(metadata_label)
-        synopsis_label = QLabel(synopsis if synopsis else "Synopsis not available")
-        synopsis_label.setWordWrap(True)
-        synopsis_label.setStyleSheet("font-size: 13px; color: #AAAAAA;")
-        info_layout.addWidget(synopsis_label)
-        self.episodes_layout.addWidget(info_widget)
+            # Batch-query watched status to avoid per-item DB calls and possible errors
+            try:
+                watched_set = self.watch_status_manager.get_watched_files(episodes)
+            except Exception:
+                watched_set = set()
 
-        # Seasons navigation
-        seasons = self.get_seasons_list(series_path)
-        if seasons:
-            seasons_widget = QWidget()
-            seasons_layout = QHBoxLayout(seasons_widget)
-            seasons_layout.setContentsMargins(0, 10, 0, 10)
-            seasons_layout.setSpacing(10)
-            
-            seasons_label = QLabel("Seasons:")
-            seasons_label.setStyleSheet("font-size: 16px; color: white;")
-            seasons_layout.addWidget(seasons_label)
-            
-            # Sort seasons naturally (Season 1, Season 2, etc.)
-            seasons_sorted = sorted(seasons, key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
-            
-            for season in seasons_sorted:
-                btn = QPushButton(season)
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #2D2D2D;
-                        color: white;
-                        border: none;
-                        padding: 5px 10px;
-                        border-radius: 4px;
-                        min-width: 80px;
-                    }
-                    QPushButton:hover {
-                        background-color: #3D3D3D;
-                    }
-                    QPushButton:pressed {
-                        background-color: #E50914;
-                    }
-                """)
-                btn.clicked.connect(lambda checked, s=season: self.show_season_episodes(series_path, s))
-                seasons_layout.addWidget(btn)
-            
-            seasons_layout.addStretch()
-            self.episodes_layout.addWidget(seasons_widget)
-
-        # Episodes list title
-        episodes_title = QLabel("Episodes")
-        episodes_title.setStyleSheet("""
-            font-size: 18px; 
-            font-weight: bold; 
-            color: white;
-            font-family: 'Netflix Sans Bold', 'Netflix Sans', 'Arial', sans-serif;
-            margin-top: 10px;
-        """)
-        self.episodes_layout.addWidget(episodes_title)
-
-        # Scrollable episodes list
-        episodes_scroll = QScrollArea()
-        episodes_scroll.setWidgetResizable(True)
-        episodes_scroll.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background: transparent;
-            }
-        """)
-        episodes_container = QWidget()
-        episodes_list_layout = QVBoxLayout(episodes_container)
-        episodes_list_layout.setContentsMargins(0, 0, 0, 0)
-        episodes_list_layout.setSpacing(10)
-
-        # Show all episodes by default, or filter by season if selected
-        displayed_episodes = set()  # Track displayed episodes to prevent duplicates
-        
-        for root, _, files in os.walk(series_path):
-            if self.current_season and os.path.basename(root) != self.current_season:
-                continue
-                
-            for file in sorted(files):
+            for file_path in sorted(episodes):
+                file = os.path.basename(file_path)
                 if any(file.lower().endswith(ext) for ext in media_extensions):
-                    file_path = os.path.join(root, file)
-                    
-                    # Create episode identifier to prevent duplicates
                     season_ep = self.extract_season_episode(file)
                     if season_ep:
                         season, episode = season_ep
                         episode_id = f"S{season:02d}E{episode:02d}"
-                        
-                        # Skip if this episode is already displayed
                         if episode_id in displayed_episodes:
                             logging.warning(f"Duplicate episode detected and skipped: {file}")
                             continue
-                            
                         displayed_episodes.add(episode_id)
                     else:
-                        # For episodes without clear S##E## format, use filename as identifier
                         file_id = os.path.splitext(file)[0].lower()
                         if file_id in displayed_episodes:
                             logging.warning(f"Duplicate episode detected and skipped: {file}")
                             continue
                         displayed_episodes.add(file_id)
-                    
+
                     episode_item = ImageItem(file_path)
-                    
                     episode_widget = QWidget()
                     ep_layout = QHBoxLayout(episode_widget)
                     ep_layout.setContentsMargins(8, 4, 8, 4)
                     ep_layout.setSpacing(10)
-                    
                     icon_label = QLabel()
                     icon_label.setPixmap(episode_item.icon().pixmap(40, 60))
                     icon_label.setFixedSize(40, 60)
                     ep_layout.addWidget(icon_label)
-                    
-                    info_layout = QVBoxLayout()
-                    info_layout.setSpacing(2)
-                    
+                    ep_info_layout = QVBoxLayout()
+                    ep_info_layout.setSpacing(2)
                     if season_ep:
-                        season, episode = season_ep
-                        ep_num_label = QLabel(f"S{season:02d}E{episode:02d}")
+                        # Unpack the season/episode info from tuple individually to avoid QVector issues
+                        s, e = int(season_ep[0]), int(season_ep[1])
+                        ep_num_label = QLabel(f"S{s:02d}E{e:02d}")
                         ep_num_label.setStyleSheet("font-size: 12px; color: #AAAAAA;")
-                        info_layout.addWidget(ep_num_label)
-                    
+                        ep_info_layout.addWidget(ep_num_label)
                     text_label = QLabel(episode_item.text())
                     text_label.setStyleSheet("font-size: 14px; color: white;")
-                    info_layout.addWidget(text_label)
-                    
-                    ep_layout.addLayout(info_layout)
-                    ep_layout.addStretch()
-                    
-                    episode_widget.setStyleSheet("""
-                        background-color: #232323;
-                        border-radius: 6px;
-                    """)
+                    ep_info_layout.addWidget(text_label)
+                    # Add info layout, then push remaining items (status) to the right
+                    ep_layout.addLayout(ep_info_layout)
+                    ep_layout.setAlignment(Qt.AlignVCenter)
+                    ep_layout.addStretch()  # push status indicator to the far right
+
+                    # Add watched status indicator (simple green dot)
+                    status_indicator = QLabel()
+                    status_indicator.setFixedSize(12, 12)
+                    status_indicator.setStyleSheet("background-color: #00FF00; border-radius: 6px;")
+                    watched = file_path in watched_set
+                    status_indicator.setVisible(watched)
+
+                    # place inside a fixed-width container and center vertically
+                    status_wrapper = QWidget()
+                    sw_layout = QHBoxLayout(status_wrapper)
+                    sw_layout.setContentsMargins(0, 0, 0, 0)
+                    sw_layout.setAlignment(Qt.AlignCenter)
+                    sw_layout.addWidget(status_indicator)
+                    status_wrapper.setFixedWidth(28)
+                    ep_layout.addWidget(status_wrapper, 0, alignment=Qt.AlignVCenter | Qt.AlignRight)
+                    episode_widget.setStyleSheet("background-color: #232323; border-radius: 6px;")
                     episode_widget.mousePressEvent = lambda e, ep=episode_item, sp=series_path: self.show_episode_details(ep, parent_series_path=sp)
-                    
-                    # Add context menu for episodes
                     episode_widget.setContextMenuPolicy(Qt.CustomContextMenu)
                     episode_widget.customContextMenuRequested.connect(lambda pos, ep=episode_item: self.show_episode_context_menu(pos, ep, episode_widget))
-                    
                     episodes_list_layout.addWidget(episode_widget)
 
-        episodes_list_layout.addStretch()
-        episodes_scroll.setWidget(episodes_container)
-        self.episodes_layout.addWidget(episodes_scroll, 1)
-        self.stacked_widget.setCurrentIndex(3)
+            episodes_list_layout.addStretch()
+            lower_layout.addWidget(episodes_container)
+            lower_layout.addStretch()
+
+            lower_scroll.setWidget(lower_container)
+
+            # Add the lower scroll area to the fixed page layout so only this part scrolls
+            page_layout.addWidget(lower_scroll)
+
+            # Replace the existing episodes view in the stacked widget with the page widget
+            try:
+                self.stacked_widget.removeWidget(self.episodes_view)
+            except Exception:
+                pass
+            self.episodes_view = page_widget
+            self.stacked_widget.insertWidget(3, self.episodes_view)
+            self.stacked_widget.setCurrentIndex(3)
+        except Exception as e:
+            logging.error("Error in show_series_episodes:\n" + traceback.format_exc())
+            try:
+                QMessageBox.critical(self, "Error", f"Failed to open series:\n{e}")
+            except Exception:
+                logging.error("Also failed to show error dialog")
+            return
         
     def show_season_episodes(self, series_path, season):
         self.current_season = season
@@ -5804,17 +6440,169 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         temp_item.setData(Qt.UserRole, series_path)
         self.show_series_episodes(temp_item)
 
+    def on_season_button_clicked(self, series_path, season):
+        """Handler for season button clicks.
+        If the requested series is already displayed, only update the episodes list area so banner and metadata remain unchanged.
+        Otherwise, fall back to showing the series page for the selected season.
+        """
+        try:
+            # If the currently displayed series matches, update episodes in-place
+            if getattr(self, 'current_series_path_in_view', None) == series_path:
+                # Update current season and refresh episodes area only
+                self.current_season = season
+                self.update_episodes_for_season(series_path, season)
+                return
+        except Exception:
+            pass
+
+        # Fallback: show full series page for the season
+        self.show_season_episodes(series_path, season)
+
+    def update_episodes_for_season(self, series_path, season):
+        """Replace the episodes_list_layout contents with episodes from the requested season only.
+        This preserves the banner_label and metadata already present in the view.
+        """
+        try:
+            layout = getattr(self, 'current_episodes_list_layout', None)
+            if layout is None:
+                # Nothing to update - fall back to full redraw
+                self.show_season_episodes(series_path, season)
+                return
+
+            # Remove existing episode widgets
+            for i in reversed(range(layout.count())):
+                widget = layout.itemAt(i).widget()
+                if widget:
+                    widget.setParent(None)
+
+            episodes = self.get_episodes_for_series(series_path, season=season)
+
+            # Batch-query watched status
+            try:
+                watched_set = self.watch_status_manager.get_watched_files(episodes)
+            except Exception:
+                watched_set = set()
+
+            displayed_episodes = set()
+            for file_path in sorted(episodes):
+                file = os.path.basename(file_path)
+                if any(file.lower().endswith(ext) for ext in media_extensions):
+                    season_ep = self.extract_season_episode(file)
+                    if season_ep:
+                        season_num, episode_num = season_ep
+                        episode_id = f"S{int(season_num):02d}E{int(episode_num):02d}"
+                        if episode_id in displayed_episodes:
+                            continue
+                        displayed_episodes.add(episode_id)
+                    else:
+                        file_id = os.path.splitext(file)[0].lower()
+                        if file_id in displayed_episodes:
+                            continue
+                        displayed_episodes.add(file_id)
+
+                    episode_item = ImageItem(file_path)
+                    episode_widget = QWidget()
+                    ep_layout = QHBoxLayout(episode_widget)
+                    ep_layout.setContentsMargins(8, 4, 8, 4)
+                    ep_layout.setSpacing(10)
+                    icon_label = QLabel()
+                    icon_label.setPixmap(episode_item.icon().pixmap(40, 60))
+                    icon_label.setFixedSize(40, 60)
+                    ep_layout.addWidget(icon_label)
+                    ep_info_layout = QVBoxLayout()
+                    ep_info_layout.setSpacing(2)
+                    if season_ep:
+                        s, e = int(season_ep[0]), int(season_ep[1])
+                        ep_num_label = QLabel(f"S{s:02d}E{e:02d}")
+                        ep_num_label.setStyleSheet("font-size: 12px; color: #AAAAAA;")
+                        ep_info_layout.addWidget(ep_num_label)
+                    text_label = QLabel(episode_item.text())
+                    text_label.setStyleSheet("font-size: 14px; color: white;")
+                    ep_info_layout.addWidget(text_label)
+                    ep_layout.addLayout(ep_info_layout)
+                    ep_layout.setAlignment(Qt.AlignVCenter)
+                    ep_layout.addStretch()
+
+                    status_indicator = QLabel()
+                    status_indicator.setFixedSize(12, 12)
+                    status_indicator.setStyleSheet("background-color: #00FF00; border-radius: 6px;")
+                    watched = file_path in watched_set
+                    status_indicator.setVisible(watched)
+
+                    status_wrapper = QWidget()
+                    sw_layout = QHBoxLayout(status_wrapper)
+                    sw_layout.setContentsMargins(0, 0, 0, 0)
+                    sw_layout.setAlignment(Qt.AlignCenter)
+                    sw_layout.addWidget(status_indicator)
+                    status_wrapper.setFixedWidth(28)
+                    ep_layout.addWidget(status_wrapper, 0, alignment=Qt.AlignVCenter | Qt.AlignRight)
+                    episode_widget.setStyleSheet("background-color: #232323; border-radius: 6px;")
+                    episode_widget.mousePressEvent = lambda e, ep=episode_item, sp=series_path: self.show_episode_details(ep, parent_series_path=sp)
+                    episode_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+                    episode_widget.customContextMenuRequested.connect(lambda pos, ep=episode_item: self.show_episode_context_menu(pos, ep, episode_widget))
+                    layout.addWidget(episode_widget)
+
+            layout.addStretch()
+        except Exception:
+            logging.error("Error updating episodes for season:\n" + traceback.format_exc())
+
     def get_seasons_list(self, series_path):
+        # Use cached scan results if available
+        if series_path in self.disk_scan_cache and 'seasons' in self.disk_scan_cache[series_path]:
+            return self.disk_scan_cache[series_path]['seasons']
+
         seasons = []
         if os.path.exists(series_path):
             for item in os.listdir(series_path):
                 item_path = os.path.join(series_path, item)
                 if os.path.isdir(item_path) and item.lower().startswith("season"):
                     seasons.append(item)
+
+        # Cache seasons for this session
+        entry = self.disk_scan_cache.get(series_path, {})
+        entry['seasons'] = seasons
+        entry.setdefault('episodes', None)
+        self.disk_scan_cache[series_path] = entry
         return seasons
+
+    def get_episodes_for_series(self, series_path, season=None):
+        """Return list of episode file paths for a series. Cached per-run."""
+        # Return cached episodes if available
+        cache_entry = self.disk_scan_cache.get(series_path, {})
+        if cache_entry.get('episodes') is not None:
+            episodes = cache_entry['episodes']
+        else:
+            episodes = []
+            seasons_found = set()
+            if os.path.exists(series_path):
+                for root, _, files in os.walk(series_path):
+                    for file in files:
+                        if any(file.lower().endswith(ext) for ext in media_extensions):
+                            file_path = os.path.join(root, file)
+                            episodes.append(file_path)
+                            base = os.path.basename(root)
+                            if base.lower().startswith('season'):
+                                seasons_found.add(base)
+            # store in cache
+            cache_entry['episodes'] = episodes
+            if 'seasons' not in cache_entry:
+                cache_entry['seasons'] = sorted(list(seasons_found))
+            self.disk_scan_cache[series_path] = cache_entry
+
+        if season:
+            filtered = [p for p in episodes if os.path.basename(os.path.dirname(p)) == season]
+            return filtered
+        return episodes
 
     def get_series_synopsis(self, series_path, return_meta=False):
         try:
+            # Use in-memory cache to avoid repeated TMDB searches for the same series during a session
+            cache_key = f"series_synopsis:{series_path}"
+            if cache_key in self.tmdb_response_cache:
+                cached = self.tmdb_response_cache[cache_key]
+                if return_meta:
+                    return cached
+                return cached[0] if cached else None
             series_name = os.path.basename(series_path)
             year = extract_year(series_name)
             
@@ -5906,6 +6694,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     f.write(overview)
                 with open(meta_path, 'w', encoding='utf-8') as f:
                     f.write(f"{imdb_rating}|{','.join(genres_named)}|{result_year}")
+                # Cache in-memory for this session
+                self.tmdb_response_cache[cache_key] = (overview, imdb_rating, genres_named, result_year)
             if return_meta:
                 return overview, imdb_rating, genres_named, result_year
             return overview
@@ -5918,6 +6708,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def get_tmdb_movie_backdrop(self, movie_title):
         """Get TMDB backdrop data for a movie"""
         try:
+            # In-memory cache for movie TMDB lookups during this session
+            year_match_temp = re.search(r'(19|20)\d{2}', movie_title)
+            year_temp = year_match_temp.group() if year_match_temp else ''
+            cache_key = f"tmdb_movie_backdrop:{movie_title.lower()}:{year_temp}"
+            if cache_key in self.tmdb_response_cache:
+                return self.tmdb_response_cache[cache_key]
             # Extract year from title if possible
             year_match = re.search(r'(19|20)\d{2}', movie_title)
             year = year_match.group() if year_match else None
@@ -5967,6 +6763,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     best_score = score
                     best_match = result
             
+            # Cache result for this session
+            self.tmdb_response_cache[cache_key] = best_match
             return best_match
             
         except Exception as e:
@@ -5976,6 +6774,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def get_tmdb_series_backdrop(self, series_name):
         """Get TMDB backdrop data for a TV series"""
         try:
+            # In-memory per-run cache to avoid repeated TMDB searches while app runs
+            year_match_temp = re.search(r'(19|20)\d{2}', series_name)
+            year_temp = year_match_temp.group() if year_match_temp else ''
+            cache_key = f"tmdb_series_backdrop:{series_name.lower()}:{year_temp}"
+            if cache_key in self.tmdb_response_cache:
+                return self.tmdb_response_cache[cache_key]
             # Extract year from series name if possible
             year_match = re.search(r'(19|20)\d{2}', series_name)
             year = year_match.group() if year_match else None
@@ -6025,6 +6829,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     best_score = score
                     best_match = result
             
+            # Cache result for this session
+            self.tmdb_response_cache[cache_key] = best_match
             return best_match
             
         except Exception as e:
@@ -6119,6 +6925,50 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 self.load_backdrop_async(banner_label, backdrop_path, "🎬", movie_title)
                 backdrop_used = True
 
+                # --- Save backdrop and synopsis into a movie-specific folder next to the file ---
+                try:
+                    movie_file = getattr(item, 'file_path', None)
+                    if movie_file:
+                        movie_dir = os.path.splitext(movie_file)[0]
+                        # Create folder next to movie file if it doesn't exist
+                        os.makedirs(movie_dir, exist_ok=True)
+
+                        # Save synopsis to movie folder if available
+                        try:
+                            if hasattr(item, 'synopsis') and item.synopsis:
+                                synopsis_path = os.path.join(movie_dir, 'synopsis.txt')
+                                with open(synopsis_path, 'w', encoding='utf-8') as sf:
+                                    sf.write(item.synopsis)
+                        except Exception:
+                            logging.debug('Failed to write synopsis to movie folder')
+
+                        # Try to copy poster from poster cache into movie folder (if exists)
+                        try:
+                            cache_name = f"{item.search_title}"
+                            if getattr(item, 'search_year', None):
+                                cache_name += f" {item.search_year}"
+                            cache_file = f"{quote(cache_name)}.jpg"
+                            poster_cache_path = os.path.join(POSTER_CACHE_DIR, cache_file)
+                            if os.path.exists(poster_cache_path):
+                                target_poster = os.path.join(movie_dir, 'poster.jpg')
+                                if not os.path.exists(target_poster):
+                                    shutil.copy2(poster_cache_path, target_poster)
+                        except Exception:
+                            logging.debug('Failed to copy poster to movie folder')
+
+                        # Download and save backdrop into movie folder (best-effort)
+                        try:
+                            TMDB_BACKDROP_URL = globals().get('TMDB_BACKDROP_URL', 'https://image.tmdb.org/t/p/original')
+                            img_url = f"{TMDB_BACKDROP_URL}{backdrop_path}"
+                            resp = requests.get(img_url, timeout=10)
+                            if resp.status_code == 200:
+                                with open(os.path.join(movie_dir, 'backdrop.jpg'), 'wb') as bf:
+                                    bf.write(resp.content)
+                        except Exception:
+                            logging.debug('Failed to download/save movie backdrop to movie folder')
+                except Exception:
+                    logging.debug('Movie folder caching skipped')
+
         if not backdrop_used:
             banner_label = QLabel()
             banner_label.setFixedHeight(300)
@@ -6143,6 +6993,18 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                             banner_label.setPixmap(banner)
                             cached_backdrop_found = True
                             break
+                # If we found a cached backdrop, also copy it into a movie-specific folder next to the file
+                if cached_backdrop_found:
+                    try:
+                        movie_file = getattr(item, 'file_path', None)
+                        if movie_file:
+                            movie_dir = os.path.splitext(movie_file)[0]
+                            os.makedirs(movie_dir, exist_ok=True)
+                            target_backdrop = os.path.join(movie_dir, 'backdrop.jpg')
+                            if not os.path.exists(target_backdrop):
+                                shutil.copy2(cache_path, target_backdrop)
+                    except Exception:
+                        logging.debug('Failed to copy cached backdrop to movie folder')
             except Exception as e:
                 logging.error(f"Error loading cached backdrop for {movie_title}: {str(e)}")
             if not cached_backdrop_found:
@@ -6438,6 +7300,37 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                             
                         processed_files.add(normalized_path)
                         item = ImageItem(file_path)
+                        # Ensure a per-movie folder exists and copy poster from global cache so thumbnails can use it immediately
+                        try:
+                            movie_dir = os.path.splitext(item.file_path)[0]
+                            os.makedirs(movie_dir, exist_ok=True)
+
+                            # Build expected poster cache filename
+                            cache_name = f"{item.search_title}"
+                            if getattr(item, 'search_year', None):
+                                cache_name += f" {item.search_year}"
+                            cache_file = f"{quote(cache_name)}.jpg"
+                            poster_cache_path = os.path.join(POSTER_CACHE_DIR, cache_file)
+
+                            target_poster = os.path.join(movie_dir, 'poster.jpg')
+                            # Copy from global poster cache if available
+                            if os.path.exists(poster_cache_path) and not os.path.exists(target_poster):
+                                try:
+                                    shutil.copy2(poster_cache_path, target_poster)
+                                except Exception:
+                                    logging.debug('Failed to copy poster to movie folder')
+
+                            # If a poster exists in movie folder, set it as the item's icon immediately
+                            if os.path.exists(target_poster):
+                                try:
+                                    pix = QPixmap(target_poster)
+                                    if not pix.isNull():
+                                        item.setIcon(QIcon(item._apply_poster_overlay(pix)))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            logging.debug('Per-movie poster setup skipped')
+
                         self.movies_list.addItem(item)
         
         self.media_lists_loaded = True
@@ -6492,6 +7385,34 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         for i in range(self.current_file_index, end_index):
             file_path = self.media_files[i]
             item = ImageItem(file_path)
+            # Copy poster into movie folder and set as thumbnail if available
+            try:
+                movie_dir = os.path.splitext(item.file_path)[0]
+                os.makedirs(movie_dir, exist_ok=True)
+
+                cache_name = f"{item.search_title}"
+                if getattr(item, 'search_year', None):
+                    cache_name += f" {item.search_year}"
+                cache_file = f"{quote(cache_name)}.jpg"
+                poster_cache_path = os.path.join(POSTER_CACHE_DIR, cache_file)
+
+                target_poster = os.path.join(movie_dir, 'poster.jpg')
+                if os.path.exists(poster_cache_path) and not os.path.exists(target_poster):
+                    try:
+                        shutil.copy2(poster_cache_path, target_poster)
+                    except Exception:
+                        logging.debug('Failed to copy poster to movie folder')
+
+                if os.path.exists(target_poster):
+                    try:
+                        pix = QPixmap(target_poster)
+                        if not pix.isNull():
+                            item.setIcon(QIcon(item._apply_poster_overlay(pix)))
+                    except Exception:
+                        pass
+            except Exception:
+                logging.debug('Per-movie poster setup skipped')
+
             self.movies_list.addItem(item)
         
         self.current_file_index = end_index
@@ -6983,6 +7904,82 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         layout.addLayout(button_layout)
         
         dialog.exec_()
+
+    def scan_duplicates_into_widget(self, list_widget):
+        """Scan for duplicates and populate the provided QListWidget with groups."""
+        try:
+            list_widget.clear()
+            duplicates_found = []
+            movie_duplicates = self.find_movie_duplicates()
+            series_duplicates = self.find_series_duplicates()
+
+            if movie_duplicates:
+                duplicates_found.extend(movie_duplicates)
+            if series_duplicates:
+                duplicates_found.extend(series_duplicates)
+
+            for dup in duplicates_found:
+                if dup.get('type') == 'movie':
+                    title = f"🎬 {dup.get('title', 'Unknown')} ({len(dup.get('files', []))} files)"
+                else:
+                    title = f"📺 {dup.get('title', 'Unknown')} ({len(dup.get('folders', []))} folders)"
+
+                item = QListWidgetItem(title)
+                item.setData(Qt.UserRole, dup)
+                list_widget.addItem(item)
+
+            if not duplicates_found:
+                QMessageBox.information(self, "No duplicates", "No duplicates found in your media library.")
+        except Exception as e:
+            logging.error(f"Error scanning duplicates into widget: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to scan for duplicates:\n{e}")
+
+    def remove_selected_duplicates_from_widget(self, list_widget):
+        """Remove duplicates selected in the inline settings list widget."""
+        selected = list_widget.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "No selection", "Please select duplicate groups to remove.")
+            return
+
+        # Build list of duplicates to remove
+        duplicates_to_remove = [it.data(Qt.UserRole) for it in selected]
+
+        # Confirm
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(f"Are you sure you want to remove duplicates from {len(duplicates_to_remove)} groups?")
+        msg.setInformativeText(f"Action: {getattr(self, 'duplicate_action', 'keep_largest').replace('_', ' ').title()}")
+        msg.setWindowTitle("Confirm Duplicate Removal")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        if msg.exec_() != QMessageBox.Yes:
+            return
+
+        removed_count = 0
+        errors = []
+        for dup in duplicates_to_remove:
+            try:
+                if dup.get('type') == 'movie':
+                    removed_count += self.remove_duplicate_movies(dup)
+                else:
+                    removed_count += self.remove_duplicate_series(dup)
+            except Exception as e:
+                errors.append(f"{dup.get('title', 'Unknown')}: {e}")
+
+        if errors:
+            err_msg = QMessageBox()
+            err_msg.setIcon(QMessageBox.Warning)
+            err_msg.setText(f"Removed {removed_count} duplicates with some errors.")
+            err_msg.setDetailedText("\n".join(errors))
+            err_msg.exec_()
+        else:
+            QMessageBox.information(self, "Duplicates Removed", f"Successfully removed {removed_count} duplicate files.")
+
+        # Refresh UI and remove items from the list
+        self.update_media_lists()
+        self.populate_series_list()
+        for it in selected:
+            list_widget.takeItem(list_widget.row(it))
     
     def toggle_all_duplicates(self, checked):
         """Toggle all duplicate checkboxes"""
@@ -7310,13 +8307,80 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             if not file_path:
                 return
 
-            if sys.platform == "win32":
-                os.startfile(file_path)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", file_path])
-            else:
-                subprocess.run(["xdg-open", file_path])
-            logging.info(f"Playing media file: {file_path}")
+            played_to_end = False
+
+            # Platform-specific launch that waits for player to exit when possible
+            try:
+                if sys.platform == "win32":
+                    # Use cmd start /WAIT to wait for the associated application to close
+                    subprocess.run(f'start "" /WAIT "{file_path}"', shell=True)
+                    played_to_end = True
+                elif sys.platform == "darwin":
+                    # open -W waits until the app is closed
+                    subprocess.run(["open", "-W", file_path])
+                    played_to_end = True
+                else:
+                    # xdg-open doesn't wait reliably; fall back to launching and ask the user after
+                    subprocess.Popen(["xdg-open", file_path])
+                    played_to_end = False
+            except Exception as e:
+                logging.warning(f"Could not launch with wait semantics: {e}")
+                # fallback to generic open
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(file_path)
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", file_path])
+                    else:
+                        subprocess.Popen(["xdg-open", file_path])
+                except Exception as e2:
+                    logging.error(f"Error launching media file: {e2}")
+                    QMessageBox.critical(self, "Error", f"Could not play media file:\n{e2}")
+                    return
+
+            # If we were able to wait for the process, ask whether to mark watched
+            try:
+                mark_now = False
+                if played_to_end:
+                    # Confirm with the user before marking; they may have closed early
+                    resp = QMessageBox.question(self, "Mark as watched?", "The player closed. Mark this file as watched?", QMessageBox.Yes | QMessageBox.No)
+                    mark_now = (resp == QMessageBox.Yes)
+                else:
+                    # Could not detect playback end; ask user whether to mark it now
+                    resp = QMessageBox.question(self, "Mark as watched?", "Did you finish watching this file and want to mark it as watched now?", QMessageBox.Yes | QMessageBox.No)
+                    mark_now = (resp == QMessageBox.Yes)
+
+                if mark_now:
+                    try:
+                        self.watch_status_manager.mark_as_watched(file_path)
+                        logging.info(f"Marked as watched: {file_path}")
+                        # Refresh series episodes view if currently viewing this series
+                        if getattr(self, 'current_series_data', None):
+                            # If the current series matches the file's series path, refresh
+                            parent_series = os.path.dirname(file_path)
+                            # If file is inside a Season folder, go one level up to series root
+                            if os.path.basename(parent_series).lower().startswith('season'):
+                                series_root = os.path.dirname(parent_series)
+                            else:
+                                series_root = parent_series
+                            try:
+                                current_series = self.current_series_data
+                                # Compare normalized absolute paths when possible
+                                if current_series:
+                                    try:
+                                        if os.path.abspath(current_series) == os.path.abspath(series_root):
+                                            self.show_series_episodes(self._make_series_item(current_series))
+                                    except Exception:
+                                        # fallback to basename compare
+                                        if os.path.basename(current_series) == os.path.basename(series_root):
+                                            self.show_series_episodes(self._make_series_item(current_series))
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logging.error(f"Error marking watched after playback: {e}")
+            except Exception as e:
+                logging.error(f"Error handling post-playback confirmation: {e}")
+
         except Exception as e:
             logging.error(f"Error playing media file: {str(e)}")
             QMessageBox.critical(self, "Error", f"Could not play media file:\n{str(e)}")
@@ -7679,8 +8743,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                                 existing_season_ep = self.extract_season_episode(existing_file)
                                 new_season_ep = self.extract_season_episode(file_name)
                                 
-                                if (existing_season_ep and new_season_ep and 
-                                    existing_season_ep == new_season_ep):
+                                if (existing_season_ep and new_season_ep and
+                                    int(existing_season_ep[0]) == int(new_season_ep[0]) and
+                                    int(existing_season_ep[1]) == int(new_season_ep[1])):
                                     logging.warning(f"Potential episode duplicate: '{file_name}' vs '{existing_file}'")
                                     return True
             
@@ -7941,7 +9006,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
         
         for folder in downloads_folders:
+            # Display with an icon prefix but store the raw path in UserRole for reliable saving
             item = QListWidgetItem(f"📂 {folder}")
+            item.setData(Qt.UserRole, folder)
             self.downloads_list.addItem(item)
         
         downloads_layout.addWidget(self.downloads_list)
@@ -7952,7 +9019,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         downloads_buttons_layout.setContentsMargins(0, 0, 0, 0)
         downloads_buttons_layout.setSpacing(10)
         
-        add_btn = QPushButton("➕ Add Folder")
+        add_btn = QPushButton("➕ Add Folder") 
         add_btn.setStyleSheet(self.get_action_button_style("#28A745"))  # Green
         add_btn.clicked.connect(self.add_downloads_folder)
         downloads_buttons_layout.addWidget(add_btn)
@@ -8087,6 +9154,72 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         cache_layout.addWidget(status_container)
         cache_section.layout().addWidget(cache_content)
         scroll_layout.addWidget(cache_section)
+
+        # Appearance Section (font preferences)
+        appearance_section = self.create_settings_section(
+            "🎨", "Appearance", "Visual preferences and font options"
+        )
+
+        appearance_content = QWidget()
+        appearance_layout = QVBoxLayout(appearance_content)
+        appearance_layout.setContentsMargins(0, 0, 0, 0)
+        appearance_layout.setSpacing(12)
+
+        # Use bundled fonts checkbox
+        bundled_chk_container = QWidget()
+        bundled_chk_layout = QHBoxLayout(bundled_chk_container)
+        bundled_chk_layout.setContentsMargins(15, 10, 15, 10)
+        bundled_chk_layout.setSpacing(15)
+        bundled_chk_container.setStyleSheet("""
+            QWidget {
+                background-color: #222222;
+                border-radius: 8px;
+                border: 1px solid #333333;
+            }
+        """)
+
+        bundled_info = QWidget()
+        bundled_info_layout = QVBoxLayout(bundled_info)
+        bundled_info_layout.setContentsMargins(0, 0, 0, 0)
+        bundled_info_layout.setSpacing(3)
+
+        bundled_title = QLabel("🔤 Use bundled fonts")
+        bundled_title.setStyleSheet("""
+            font-size: 14px;
+            font-weight: bold;
+            color: white;
+        """)
+        bundled_info_layout.addWidget(bundled_title)
+
+        bundled_desc = QLabel("Enable to use the bundled Netflix Sans fonts. Disable to use system fonts (helps EXE compatibility).")
+        bundled_desc.setStyleSheet("""
+            font-size: 12px;
+            color: #AAAAAA;
+            margin: 0px;
+        """)
+        bundled_desc.setWordWrap(True)
+        bundled_info_layout.addWidget(bundled_desc)
+
+        bundled_chk_layout.addWidget(bundled_info, 1)
+
+        # Create the checkbox and set current value from user_settings if available
+        self.bundled_fonts_checkbox = QCheckBox()
+        try:
+            checked = True
+            if hasattr(self, 'user_settings'):
+                checked = bool(self.user_settings.get('use_bundled_fonts', True))
+            self.bundled_fonts_checkbox.setChecked(checked)
+        except Exception:
+            self.bundled_fonts_checkbox.setChecked(True)
+
+        self.bundled_fonts_checkbox.setStyleSheet("""
+            QCheckBox { color: white; font-size: 13px; }
+        """)
+        bundled_chk_layout.addWidget(self.bundled_fonts_checkbox)
+
+        appearance_layout.addWidget(bundled_chk_container)
+        appearance_section.layout().addWidget(appearance_content)
+        scroll_layout.addWidget(appearance_section)
         
         # Refresh & Maintenance Section
         refresh_section = self.create_settings_section(
@@ -8215,6 +9348,63 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         refresh_section.layout().addWidget(refresh_content)
         scroll_layout.addWidget(refresh_section)
         
+        # Inline Find & Remove Duplicates Section (allows scanning and removing without leaving Settings)
+        duplicates_section = self.create_settings_section(
+            "🔎", "Find & Remove Duplicates", "Scan and review duplicate movies and series directly in Settings"
+        )
+
+        duplicates_content = QWidget()
+        duplicates_content_layout = QVBoxLayout(duplicates_content)
+        duplicates_content_layout.setContentsMargins(0, 0, 0, 0)
+        duplicates_content_layout.setSpacing(12)
+
+        # Top action row
+        dup_actions = QWidget()
+        dup_actions_layout = QHBoxLayout(dup_actions)
+        dup_actions_layout.setContentsMargins(0, 0, 0, 0)
+        dup_actions_layout.setSpacing(10)
+
+        scan_btn = QPushButton("🔍 Scan for Duplicates")
+        scan_btn.setStyleSheet(self.get_action_button_style("#FF8C00"))
+        # Will populate the duplicates_list below when clicked
+        duplicates_list = QListWidget()
+        duplicates_list.setSelectionMode(QListWidget.MultiSelection)
+        duplicates_list.setStyleSheet("""
+            QListWidget { background-color: #222222; border: 1px solid #444444; border-radius: 8px; padding: 8px; min-height: 120px; }
+            QListWidget::item { padding: 8px 12px; }
+            QListWidget::item:selected { background-color: #E50914; color: white; }
+        """)
+
+        scan_btn.clicked.connect(lambda: self.scan_duplicates_into_widget(duplicates_list))
+        dup_actions_layout.addWidget(scan_btn)
+
+        view_btn = QPushButton("👁️ View Selected")
+        view_btn.setStyleSheet(self.get_action_button_style("#2D2D2D"))
+        view_btn.clicked.connect(lambda: [self.show_duplicates_dialog([it.data(Qt.UserRole)]) for it in duplicates_list.selectedItems()])
+        dup_actions_layout.addWidget(view_btn)
+
+        remove_selected_btn = QPushButton("🗑️ Remove Selected")
+        remove_selected_btn.setStyleSheet(self.get_action_button_style("#E50914"))
+        remove_selected_btn.clicked.connect(lambda: self.remove_selected_duplicates_from_widget(duplicates_list))
+        dup_actions_layout.addWidget(remove_selected_btn)
+
+        select_all_dup = QPushButton("Select All")
+        select_all_dup.setStyleSheet(self.get_action_button_style("#2D2D2D"))
+        select_all_dup.clicked.connect(lambda: [it.setSelected(True) for it in duplicates_list.findItems("*", Qt.MatchWildcard)])
+        dup_actions_layout.addWidget(select_all_dup)
+
+        deselect_all_dup = QPushButton("Deselect All")
+        deselect_all_dup.setStyleSheet(self.get_action_button_style("#2D2D2D"))
+        deselect_all_dup.clicked.connect(lambda: [it.setSelected(False) for it in duplicates_list.findItems("*", Qt.MatchWildcard)])
+        dup_actions_layout.addWidget(deselect_all_dup)
+
+        dup_actions_layout.addStretch()
+        duplicates_content_layout.addWidget(dup_actions)
+        duplicates_content_layout.addWidget(duplicates_list)
+
+        duplicates_section.layout().addWidget(duplicates_content)
+        scroll_layout.addWidget(duplicates_section)
+
         scroll_layout.addStretch()
         scroll_area.setWidget(scroll_content)
         layout.addWidget(scroll_area)
@@ -8586,11 +9776,15 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             for i in range(self.downloads_list.count()):
                 item_text = self.downloads_list.item(i).text()
                 # Remove the folder icon when comparing
-                existing_folder = item_text.replace("📂 ", "") if item_text.startswith("📂 ") else item_text
+                # Prefer stored UserRole if available
+                existing_item = self.downloads_list.item(i)
+                existing_folder = existing_item.data(Qt.UserRole) if existing_item.data(Qt.UserRole) else (item_text.replace("📂 ", "") if item_text.startswith("📂 ") else item_text)
                 if existing_folder == folder:
                     return
-            # Add new folder with icon
-            self.downloads_list.addItem(QListWidgetItem(f"📂 {folder}"))
+            # Add new folder with icon and store raw path in UserRole
+            new_item = QListWidgetItem(f"📂 {folder}")
+            new_item.setData(Qt.UserRole, folder)
+            self.downloads_list.addItem(new_item)
     
     def remove_downloads_folder(self):
         current_item = self.downloads_list.currentItem()
@@ -8613,22 +9807,57 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         new_movies_folder = self.movies_folder_edit.text()
         new_series_folder = self.series_folder_edit.text()
         
+        # Collect raw download folder paths (stored in UserRole) to avoid saving UI emoji prefixes
         new_downloads_folders = []
         for i in range(self.downloads_list.count()):
-            new_downloads_folders.append(self.downloads_list.item(i).text())
-        
+            itm = self.downloads_list.item(i)
+            path = itm.data(Qt.UserRole)
+            if not path:
+                # Fallback: strip emoji prefix if data not present
+                txt = itm.text()
+                path = txt.replace("📂 ", "") if txt.startswith("📂 ") else txt
+            new_downloads_folders.append(path)
+        # Bundled fonts preference
+        new_use_bundled = True
+        try:
+            if hasattr(self, 'bundled_fonts_checkbox'):
+                new_use_bundled = bool(self.bundled_fonts_checkbox.isChecked())
+        except Exception:
+            new_use_bundled = True
+
         settings_changed = (
             new_movies_folder != movies_folder or
             new_series_folder != series_folder or
-            new_downloads_folders != downloads_folders
+            new_downloads_folders != downloads_folders or
+            new_use_bundled != (self.user_settings.get('use_bundled_fonts', True) if hasattr(self, 'user_settings') else True)
         )
-        
+
         if settings_changed:
             movies_folder = new_movies_folder
             series_folder = new_series_folder
             downloads_folders = new_downloads_folders
-            
             self.update_media_lists()
+
+            # Persist bundled fonts preference
+            try:
+                if not hasattr(self, 'user_settings'):
+                    self.user_settings = {}
+                self.user_settings['use_bundled_fonts'] = new_use_bundled
+                self.save_user_settings()
+            except Exception:
+                logging.exception("Failed to persist user settings")
+
+            # Apply font preference immediately where possible
+            try:
+                if new_use_bundled:
+                    # Try to load bundled fonts now
+                    self.load_custom_fonts()
+                else:
+                    # Switch to default system font
+                    QApplication.setFont(QFont())
+                    logging.info("Switched to system fonts per user preference")
+            except Exception:
+                logging.exception("Error applying font preference at runtime")
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Information)
             msg.setText("Settings have been saved successfully!")
@@ -8654,6 +9883,17 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             QMessageBox.information(self, "Settings", "No changes were made to settings.")
 
 if __name__ == "__main__":
+    # Register custom metatypes before creating QApplication
+    import sip
+    sip.setapi('QVector', 2)
+    
+    # Enable high DPI scaling and pixmaps before creating the application
+    try:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     try:
         check_tmdb_api_key()
