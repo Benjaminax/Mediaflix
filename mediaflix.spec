@@ -5,7 +5,7 @@ a = Analysis(
     ['mediaflix.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets', 'assets'), ('backend', 'backend'), ('C:\\Users\\kojob\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyQt5\\Qt5\\plugins\\platforms', 'platforms')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
