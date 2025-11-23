@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog,
                             QMessageBox, QStackedWidget, QScrollArea, QFrame, QDialog, QLineEdit,
                             QSizePolicy, QSpacerItem, QTextEdit, QComboBox, QGroupBox, QGridLayout, QMenu,
-                            QRadioButton, QCheckBox, QProgressBar, QGraphicsOpacityEffect)
+                            QRadioButton, QCheckBox, QProgressBar, QGraphicsOpacityEffect, QInputDialog)
 
 # --- Global error handling and startup checks ---
 import traceback
@@ -43,7 +43,7 @@ def excepthook(type, value, tb):
     sys.exit(1)
 
 sys.excepthook = excepthook
-from PyQt5.QtCore import Qt, QSize, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QSize, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QObject, QEventLoop, QEvent
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QPainter, QFontDatabase, QLinearGradient, QPainterPath
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +52,8 @@ import json
 import random
 import getpass
 from pathlib import Path
+import hashlib
+
 
 # Dynamically get the user's home directory
 home_directory = os.path.expanduser("~")
@@ -73,6 +75,22 @@ TMDB_BACKDROP_URL = "https://image.tmdb.org/t/p/original"  # Higher resolution f
 POSTER_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "posters")
 BACKDROP_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "backdrops")
 SYNOPSIS_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "synopsis")
+THUMBNAIL_CACHE_DIR = os.path.join(home_directory, ".media_organizer_cache", "thumbnails")
+
+
+
+
+def get_resource_path(*parts):
+    """Return an absolute path to a resource bundled with the app.
+
+    When running as a PyInstaller onefile bundle, resources are extracted
+    to `sys._MEIPASS`. Otherwise, resources live next to this script.
+    """
+    try:
+        base = getattr(sys, '_MEIPASS')
+    except Exception:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
 
 # Set up logging
 log_file = os.path.join(home_directory, "media_organizer.log")
@@ -1129,25 +1147,59 @@ class MediaOrganizerApp(QMainWindow):
                 background-color: #F40612;
             }
         """)
+        # Use silent navigation on Back to avoid modal messages.
         if parent_series_path:
-            back_button.clicked.connect(lambda: self.show_series_episodes(self._make_series_item(parent_series_path)))
+            def _silent_back_to_series():
+                try:
+                    # ensure the series view is prepared and switch to it without popping modal dialogs
+                    self.current_series_path_in_view = parent_series_path
+                    # refresh episodes area for current season if present
+                    try:
+                        self.update_episodes_for_season(parent_series_path, getattr(self, 'current_season', None))
+                    except Exception:
+                        try:
+                            self.show_series_episodes(self._make_series_item(parent_series_path))
+                        except Exception:
+                            pass
+                    # switch to episodes view index (3)
+                    try:
+                        self.stacked_widget.setCurrentIndex(3)
+                    except Exception:
+                        self.stacked_widget.setCurrentIndex(2)
+                except Exception:
+                    try:
+                        self.stacked_widget.setCurrentIndex(2)
+                    except Exception:
+                        pass
+            back_button.clicked.connect(_silent_back_to_series)
         else:
             back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
-        self.details_layout.addWidget(back_button, alignment=Qt.AlignLeft)
+        # create a header row so we can place back button at left and bookmark button at top-right
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.addWidget(back_button)
+        header_layout.addStretch()
+        # store header_layout so the bookmark button can be added to the same row later
+        try:
+            self.current_details_header_layout = header_layout
+        except Exception:
+            self.current_details_header_layout = None
+        self.details_layout.addWidget(header_widget)
 
         # --- Caching logic for episode synopsis and backdrop ---
         import os
         from urllib.parse import quote
+        # Determine episode path and display filename (use basename so UI shows friendly name)
+        ep_path = getattr(episode_item, 'file_path', None) or (episode_item.text() if hasattr(episode_item, 'text') else None)
+        filename = os.path.basename(ep_path) if ep_path else (episode_item.text() if hasattr(episode_item, 'text') else '')
         # Determine series name
         series_name = None
         if parent_series_path:
             series_name = os.path.basename(parent_series_path)
         else:
-            if hasattr(episode_item, 'text'):
-                ep_path = episode_item.text()
-                if os.path.sep in ep_path:
-                    series_name = os.path.basename(os.path.dirname(os.path.dirname(ep_path)))
-        filename = episode_item.text()
+            if ep_path and os.path.sep in ep_path:
+                series_name = os.path.basename(os.path.dirname(os.path.dirname(ep_path)))
         season_episode = self.extract_season_episode(filename)
         season_num, episode_num = (season_episode if season_episode else (1, 1))
         cache_base = f"{series_name}_S{season_num:02d}E{episode_num:02d}"
@@ -1287,8 +1339,8 @@ class MediaOrganizerApp(QMainWindow):
         synopsis_text.setFixedHeight(100)
         details_layout.addWidget(synopsis_text)
 
-        # Play button
-        play_button = QPushButton("Play")
+        # Add Play button for the episode
+        play_button = QPushButton("▶ Play Episode")
         play_button.setStyleSheet("""
             QPushButton {
                 background-color: #E50914;
@@ -1296,15 +1348,28 @@ class MediaOrganizerApp(QMainWindow):
                 border: none;
                 padding: 12px 24px;
                 font-size: 16px;
-                border-radius: 4px;
+                font-weight: bold;
+                border-radius: 6px;
                 margin-top: 20px;
-                max-width: 150px;
+                min-width: 150px;
             }
             QPushButton:hover {
                 background-color: #F40612;
+                transform: scale(1.05);
+            }
+            QPushButton:pressed {
+                background-color: #CC0812;
             }
         """)
-        play_button.clicked.connect(lambda: self.play_media(episode_item))
+        
+        # Connect play button to play the episode
+        def play_episode():
+            try:
+                self.play_media(episode_item)
+            except Exception as e:
+                logging.error(f"Error playing episode: {e}")
+        
+        play_button.clicked.connect(play_episode)
         details_layout.addWidget(play_button)
 
         details_layout.addStretch()
@@ -1371,6 +1436,31 @@ class MediaOrganizerApp(QMainWindow):
         except Exception:
             logging.exception("load_custom_fonts failed")
         self.set_dark_theme()
+
+
+        # Load bookmark icons from assets for episode bookmark indicators and toggle button
+        try:
+            assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
+            # Unticked (default) bookmark icon (previously added)
+            unticked_name = 'hd-bookmark-white-icon-symbol-transparent-png-701751695035657vmpoicgjwz (1).png'
+            unticked_asset = os.path.join(assets_dir, unticked_name)
+            if os.path.exists(unticked_asset):
+                pix = QPixmap(unticked_asset)
+                self.bookmark_pixmap_unticked = pix.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not pix.isNull() else None
+            else:
+                self.bookmark_pixmap_unticked = None
+
+            # Ticked (bookmarked) icon (new)
+            ticked_name = 'bookmark-icon-vector-white-on-260nw-1035134407 (1).png'
+            ticked_asset = os.path.join(assets_dir, ticked_name)
+            if os.path.exists(ticked_asset):
+                pix2 = QPixmap(ticked_asset)
+                self.bookmark_pixmap_ticked = pix2.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not pix2.isNull() else None
+            else:
+                self.bookmark_pixmap_ticked = None
+        except Exception:
+            self.bookmark_pixmap_unticked = None
+            self.bookmark_pixmap_ticked = None
         # Apply runtime optimizations (best-effort)
         try:
             self.optimize_font_rendering()
@@ -1488,7 +1578,7 @@ class MediaOrganizerApp(QMainWindow):
                 logging.info("User preference set to not use bundled fonts; skipping font registration")
                 return
 
-            font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
+            font_dir = get_resource_path("assets", "fonts")
             if os.path.isdir(font_dir):
                 loaded = []
                 for fname in os.listdir(font_dir):
@@ -1972,6 +2062,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.home_button = QPushButton("Home")
         self.movies_button = QPushButton("Movies")
         self.series_button = QPushButton("TV Series")
+        self.recently_watched_button = QPushButton("Recently Watched")
         self.sort_button = QPushButton("Sort Files")
         
         # Navigation buttons that can remain highlighted (Home, Movies and Series)
@@ -2008,6 +2099,19 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             nav_font = self.create_crisp_font("Netflix Sans Medium", 16)
             btn.setFont(nav_font)
             self.sidebar_layout.addWidget(btn)
+
+        # Recently Watched button (does not remain persistently highlighted like Home/Movies/Series)
+        self.recently_watched_button.setCursor(Qt.PointingHandCursor)
+        self.recently_watched_button.clicked.connect(self.create_tab_handler(self.recently_watched_button, self.show_recently_watched_tab))
+        self.recently_watched_button.setStyleSheet("""
+            QPushButton { text-align: left; padding: 12px 20px; font-size: 16px; background-color: transparent; }
+            QPushButton:hover { background-color: #2D2D2D; }
+        """)
+        recently_watched_font = self.create_crisp_font("Netflix Sans Medium", 16)
+        self.recently_watched_button.setFont(recently_watched_font)
+        self.sidebar_layout.addWidget(self.recently_watched_button)
+
+        
 
         # Sort button with special behavior (temporary highlight only)
         self.sort_button.setCursor(Qt.PointingHandCursor)
@@ -2116,42 +2220,53 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """)
     
     def set_active_tab(self, button):
-        # Only allow Home, Movies and Series buttons to remain highlighted
-        if button not in [self.home_button, self.movies_button, self.series_button]:
+        # Allow Home, Movies, Series and Recently Watched buttons to remain highlighted
+        persistent_buttons = [self.home_button, self.movies_button, self.series_button]
+        # include recently_watched_button if present
+        if hasattr(self, 'recently_watched_button'):
+            persistent_buttons.append(self.recently_watched_button)
+
+        if button not in persistent_buttons:
             return
-            
-        # Reset Home, Movies and Series buttons to inactive state
-        for btn in [self.home_button, self.movies_button, self.series_button]:
-            btn.setChecked(False)
-            btn.setStyleSheet("""
+
+        # Reset persistent buttons to inactive state
+        for btn in persistent_buttons:
+            try:
+                btn.setChecked(False)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        text-align: left;
+                        padding: 12px 20px;
+                        font-size: 16px;
+                        border-radius: 0;
+                        background-color: transparent;
+                    }
+                    QPushButton:hover {
+                        background-color: #2D2D2D;
+                    }
+                """)
+            except Exception:
+                pass
+
+        # Set the clicked button as active
+        try:
+            button.setChecked(True)
+            button.setStyleSheet("""
                 QPushButton {
                     text-align: left;
                     padding: 12px 20px;
                     font-size: 16px;
                     border-radius: 0;
-                    background-color: transparent;
+                    background-color: #E50914;
+                    font-weight: bold;
                 }
                 QPushButton:hover {
-                    background-color: #2D2D2D;
+                    background-color: #F40612;
                 }
             """)
-        
-        # Set the clicked button as active
-        button.setChecked(True)
-        button.setStyleSheet("""
-            QPushButton {
-                text-align: left;
-                padding: 12px 20px;
-                font-size: 16px;
-                border-radius: 0;
-                background-color: #E50914;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #F40612;
-            }
-        """)
-        
+        except Exception:
+            pass
+
         self.active_tab = button
 
     def refresh_all(self):
@@ -2297,22 +2412,44 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         """Handle manual cache completion"""
         self.on_cache_completed()
         button.setText("✅ Done")
-        button.setStyleSheet("""
-            QPushButton {
-                background-color: #28A745;
-                color: white;
-                border: none;
-                padding: 10px 18px;
-                font-size: 13px;
-                border-radius: 6px;
-                font-weight: 600;
-                min-width: 100px;
-            }
-        """)
-        button.setEnabled(False)
-        
-        # Reset button after 3 seconds
-        QTimer.singleShot(3000, lambda: self.reset_cache_button(button))
+
+
+
+    def get_user_top_genres(self, top_n=5):
+        """Detect top genres from cached metadata in `SYNOPSIS_CACHE_DIR`.
+
+        It reads *_meta.txt files written by `load_metadata`, where the format is
+        `<imdb_rating>|<comma-separated-genre-names>|<release_year>`.
+        Returns an ordered list of genre names (strings).
+        """
+        try:
+            counts = {}
+            if not os.path.isdir(SYNOPSIS_CACHE_DIR):
+                return []
+            for fname in os.listdir(SYNOPSIS_CACHE_DIR):
+                if not fname.endswith('_meta.txt'):
+                    continue
+                path = os.path.join(SYNOPSIS_CACHE_DIR, fname)
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        txt = f.read().strip()
+                        parts = txt.split('|')
+                        if len(parts) >= 2:
+                            genre_field = parts[1].strip()
+                            if genre_field:
+                                for g in genre_field.split(','):
+                                    g = g.strip()
+                                    if g:
+                                        counts[g] = counts.get(g, 0) + 1
+                except Exception:
+                    continue
+            if not counts:
+                return []
+            # sort by frequency, return top_n
+            sorted_genres = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+            return [g for g, _ in sorted_genres[:top_n]]
+        except Exception:
+            return []
     
     def reset_cache_button(self, button):
         """Reset the cache button to original state"""
@@ -2398,6 +2535,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.home_details_layout.setContentsMargins(20, 15, 20, 15)
         self.home_details_layout.setSpacing(20)
         self.stacked_widget.addWidget(self.home_details_view)
+
+        # Recently Watched view (index next) - shows recently watched media from your local DB
+        self.recently_watched_view = self.create_recently_watched_view()
+        self.stacked_widget.addWidget(self.recently_watched_view)
+        
+
         
         self.content_layout.addWidget(self.stacked_widget)
         self.main_layout.addWidget(self.content_area, 1)
@@ -2484,7 +2627,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         title_layout.addWidget(underline)
         
         layout.addWidget(title_container)
-        
         # Content filter widget - Toggle between Movies and TV Series
         filter_container = QWidget()
         filter_layout = QHBoxLayout(filter_container)
@@ -2593,7 +2735,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         filter_layout.addWidget(self.reload_home_btn)
         
         layout.addWidget(filter_container)
-        
+
+
         # Create content area that will be populated asynchronously
         self.home_content_area = QWidget()
         self.home_content_layout = QVBoxLayout(self.home_content_area)
@@ -2612,6 +2755,917 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         QTimer.singleShot(10, self.load_home_content_async)
         
         return scroll_area
+
+    def create_recently_watched_view(self):
+        """Create the Recently Watched tab which lists items from the watch history."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        container = QWidget()
+        container.setStyleSheet("background-color: #111;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(20, 15, 20, 20)
+        layout.setSpacing(18)
+
+        # Header with title and refresh button
+        header = QWidget()
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Recently Watched")
+        title.setStyleSheet("font-size: 26px; font-weight: 700; color: white;")
+        title.setFont(self.create_crisp_font("Netflix Sans Bold", 26, bold=True))
+        h_layout.addWidget(title)
+        h_layout.addStretch()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setStyleSheet("QPushButton { background-color: #2D2D2D; color: white; padding: 8px 12px; border-radius: 6px; }")
+        refresh_btn.clicked.connect(self.refresh_recently_watched)
+        h_layout.addWidget(refresh_btn)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setStyleSheet("QPushButton { background-color: #2D2D2D; color: white; padding: 8px 12px; border-radius: 6px; }")
+        clear_btn.clicked.connect(self.clear_recently_watched)
+        h_layout.addWidget(clear_btn)
+        layout.addWidget(header)
+
+        # Sections container
+        self.recently_watched_sections_container = QWidget()
+        self.recently_watched_sections_layout = QVBoxLayout(self.recently_watched_sections_container)
+        self.recently_watched_sections_layout.setContentsMargins(0, 0, 0, 0)
+        self.recently_watched_sections_layout.setSpacing(14)
+
+        layout.addWidget(self.recently_watched_sections_container)
+        layout.addStretch()
+
+        scroll_area.setWidget(container)
+        return scroll_area
+
+    def show_recently_watched_tab(self):
+        try:
+            self.stacked_widget.setCurrentWidget(self.recently_watched_view)
+            QTimer.singleShot(50, self.refresh_recently_watched)
+        except Exception:
+            try:
+                self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.recently_watched_view))
+            except Exception:
+                pass
+
+    def refresh_recently_watched(self):
+        """Rebuild the Recently Watched section from the watch history DB."""
+        try:
+            # Clear previous widgets
+            for i in reversed(range(self.recently_watched_sections_layout.count())):
+                w = self.recently_watched_sections_layout.itemAt(i).widget()
+                if w:
+                    w.setParent(None)
+
+            # Gather recently watched from DB and recently accessed files from disk
+            recent_records = {}
+
+            # DB-provided recently watched (high priority)
+            try:
+                db_recent = self.watch_status_manager.get_recently_watched(128) or []
+                for r in db_recent:
+                    fp = r.get('file_path')
+                    ts = r.get('last_watched')
+                    if fp and os.path.exists(fp):
+                        # if user cleared recently, get_recently_watched will already omit cleared rows
+                        recent_records[fp] = max(recent_records.get(fp, 0) or 0, ts or 0)
+            except Exception:
+                pass
+
+            # Filesystem: recently accessed within movies and series folders
+            try:
+                fs_recent = self._gather_recently_accessed(256)
+                for rec in fs_recent:
+                    p = rec.get('path')
+                    t = rec.get('meta')
+                    if p and os.path.exists(p):
+                        # respect user cleared time if set
+                        if getattr(self, 'recently_cleared_at', None) and (t or 0) <= (self.recently_cleared_at or 0):
+                            continue
+                        recent_records[p] = max(recent_records.get(p, 0) or 0, t or 0)
+            except Exception:
+                pass
+
+            # Windows Recent Items: include resolved shortcuts for better accuracy on Windows
+            try:
+                win_recent = self._gather_windows_recent_shortcuts(256)
+                for rec in win_recent:
+                    p = rec.get('path')
+                    t = rec.get('meta')
+                    if p and os.path.exists(p):
+                        if getattr(self, 'recently_cleared_at', None) and (t or 0) <= (self.recently_cleared_at or 0):
+                            continue
+                        recent_records[p] = max(recent_records.get(p, 0) or 0, t or 0)
+            except Exception:
+                pass
+
+            # Build sorted list
+            items = [{'path': p, 'meta': recent_records[p], 'title': os.path.basename(p)} for p in recent_records]
+            items.sort(key=lambda x: x.get('meta') or 0, reverse=True)
+
+            # Limit and build display records
+            display = []
+            for it in items[:64]:
+                display.append({'title': it.get('title'), 'path': it.get('path'), 'meta': it.get('meta')})
+
+            if display:
+                sec = self._build_recently_watched_list(display)
+                self.recently_watched_sections_layout.addWidget(sec)
+
+            self.recently_watched_sections_layout.addStretch()
+        except Exception:
+            logging.error("Error refreshing Recently Watched tab:\n" + traceback.format_exc())
+
+    def _gather_recently_accessed(self, limit=128):
+        """Scan movies and series folders for recently accessed files using atime/mtime as fallback."""
+        results = []
+        try:
+            seen = set()
+            for base in [movies_folder, series_folder]:
+                if not base or not os.path.exists(base):
+                    continue
+                for root, _, files in os.walk(base):
+                    for f in files:
+                        if any(f.lower().endswith(ext) for ext in media_extensions):
+                            p = os.path.join(root, f)
+                            if p in seen:
+                                continue
+                            seen.add(p)
+                            try:
+                                at = os.path.getatime(p)
+                            except Exception:
+                                try:
+                                    at = os.path.getmtime(p)
+                                except Exception:
+                                    at = 0
+                            results.append({'path': p, 'meta': at})
+            results.sort(key=lambda x: x.get('meta') or 0, reverse=True)
+            return results[:limit]
+        except Exception:
+            logging.error("Error gathering recently accessed files:\n" + traceback.format_exc())
+            return results
+
+        # On Windows, also inspect the user's Recent Items shortcuts for higher-fidelity recency
+        # (handled below in case earlier scanning returned little)
+
+    def _gather_windows_recent_shortcuts(self, limit=128):
+        """Parse Windows Recent Items (.lnk and .url) and resolve targets using win32com when available.
+
+        Returns a list of {'path': target_path, 'meta': timestamp}
+        """
+        results = []
+        try:
+            if not sys.platform.startswith('win'):
+                return results
+
+            appdata = os.environ.get('APPDATA') or os.environ.get('AppData')
+            if not appdata:
+                return results
+
+            recent_dir = os.path.join(appdata, 'Microsoft', 'Windows', 'Recent')
+            if not os.path.isdir(recent_dir):
+                return results
+
+            # Try to import win32com for resolving .lnk shortcuts; it's optional
+            win32 = None
+            try:
+                import win32com.client as win32com_client
+                win32 = win32com_client
+            except Exception:
+                win32 = None
+
+            seen = set()
+            for fname in os.listdir(recent_dir):
+                try:
+                    if not fname.lower().endswith(('.lnk', '.url')):
+                        continue
+                    full = os.path.join(recent_dir, fname)
+                    target = None
+                    # Resolve .lnk via win32com if available
+                    if fname.lower().endswith('.lnk') and win32 is not None:
+                        try:
+                            shell = win32.Dispatch('WScript.Shell')
+                            shortcut = shell.CreateShortcut(full)
+                            target = getattr(shortcut, 'Targetpath', None)
+                            # Some shortcuts include arguments or workingdir; prefer Targetpath
+                        except Exception:
+                            target = None
+                    elif fname.lower().endswith('.url'):
+                        # Simple parse for .url files (INI-like)
+                        try:
+                            with open(full, 'r', encoding='utf-8', errors='ignore') as fh:
+                                for line in fh:
+                                    if line.strip().lower().startswith('url='):
+                                        target = line.split('=', 1)[1].strip()
+                                        break
+                        except Exception:
+                            target = None
+
+                    if not target:
+                        # Fallback: check for embedded .lnk content using pylnk not available; skip
+                        continue
+
+                    # normalize
+                    if target and isinstance(target, str):
+                        target = target.strip('"')
+                        if os.path.exists(target) and any(target.lower().endswith(ext) for ext in media_extensions):
+                            if target in seen:
+                                continue
+                            seen.add(target)
+                            try:
+                                meta = os.path.getmtime(full)
+                            except Exception:
+                                try:
+                                    meta = os.path.getmtime(target)
+                                except Exception:
+                                    meta = 0
+                            results.append({'path': target, 'meta': meta})
+                except Exception:
+                    continue
+
+            results.sort(key=lambda x: x.get('meta') or 0, reverse=True)
+            return results[:limit]
+        except Exception:
+            logging.error('Error gathering Windows Recent shortcuts:\n' + traceback.format_exc())
+            return results
+
+    def _build_media_section(self, title, records):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QLabel(title)
+        header.setStyleSheet("font-size:18px; font-weight:600; color: white;")
+        header.setFont(self.create_crisp_font("Netflix Sans Medium", 18))
+        layout.addWidget(header)
+
+        # Grid view using TMDB API to fetch accurate posters where possible
+        grid_container = QWidget()
+        grid_layout = QGridLayout(grid_container)
+        grid_layout.setContentsMargins(6, 8, 6, 8)
+        grid_layout.setSpacing(12)
+
+        cols = 4
+        row = 0
+        col = 0
+
+        def lookup_and_set_poster(label, file_path, title_hint=None):
+            """Lookup TMDB for the best poster path for this file and load it asynchronously."""
+            try:
+                # derive search terms
+                base = os.path.splitext(os.path.basename(file_path))[0]
+                year = extract_year(base)
+                # detect TV episode
+                s_info = extract_series_info(os.path.basename(file_path))
+                is_ep = s_info[0] is not None
+
+                cache_key = (base.lower(), year or '')
+                poster_path = None
+
+                if cache_key in self.tmdb_response_cache:
+                    poster_path = self.tmdb_response_cache[cache_key]
+                else:
+                    try:
+                        if is_ep:
+                            # search TV series
+                            series_name = s_info[0]
+                            params = {"api_key": TMDB_API_KEY, "query": series_name}
+                            resp = requests.get(f"{TMDB_API_URL}/search/tv", params=params, timeout=8)
+                            resp.raise_for_status()
+                            data = resp.json()
+                            results = data.get('results', [])
+                            # Score results by title similarity and year match to pick the most likely match
+                            def score_tv_result(file_base, res):
+                                try:
+                                    score = 0
+                                    title = (res.get('name') or '').lower()
+                                    file_key = re.sub(r'[^a-z0-9]', ' ', file_base.lower())
+                                    # exact match
+                                    if title == file_key.strip():
+                                        score += 100
+                                    # token overlap
+                                    title_tokens = set(re.split(r'\s+', re.sub(r'[^a-z0-9]', ' ', title)))
+                                    file_tokens = set(re.split(r'\s+', file_key))
+                                    inter = len(title_tokens & file_tokens)
+                                    score += inter * 8
+                                    # year match
+                                    ry = (res.get('first_air_date','')[:4])
+                                    if year and ry and str(year) == ry:
+                                        score += 25
+                                    # startswith or contains
+                                    if file_key.strip() and file_key.strip() in title:
+                                        score += 10
+                                    return score
+                                except Exception:
+                                    return 0
+
+                            best = None
+                            best_score = -1
+                            for r in results:
+                                s = score_tv_result(base, r)
+                                if s > best_score:
+                                    best_score = s
+                                    best = r
+                            if best:
+                                tv_id = best.get('id')
+                                # try to fetch episode still
+                                try:
+                                    # parse season/ep
+                                    m = re.search(r'[sS](\d{1,2})[eE](\d{1,2})', os.path.basename(file_path)) or re.search(r'\b(\d{1,2})[xX](\d{1,2})\b', os.path.basename(file_path))
+                                    if m:
+                                        season = int(m.group(1))
+                                        episode = int(m.group(2))
+                                        ep_url = f"{TMDB_API_URL}/tv/{tv_id}/season/{season}/episode/{episode}"
+                                        ep_resp = requests.get(ep_url, params={"api_key": TMDB_API_KEY}, timeout=8)
+                                        if ep_resp.status_code == 200:
+                                            ep_data = ep_resp.json()
+                                            poster_path = ep_data.get('still_path') or best.get('poster_path') or best.get('backdrop_path')
+                                except Exception:
+                                    poster_path = best.get('poster_path') or best.get('backdrop_path')
+                        else:
+                            # movie/general search
+                            params = {"api_key": TMDB_API_KEY, "query": base}
+                            if year:
+                                params['year'] = year
+                            resp = requests.get(f"{TMDB_API_URL}/search/movie", params=params, timeout=8)
+                            resp.raise_for_status()
+                            data = resp.json()
+                            results = data.get('results', [])
+                            # Score movie results by title similarity and year
+                            def score_movie_result(file_base, res):
+                                try:
+                                    score = 0
+                                    title = (res.get('title') or res.get('original_title') or '').lower()
+                                    file_key = re.sub(r'[^a-z0-9]', ' ', file_base.lower())
+                                    if title == file_key.strip():
+                                        score += 100
+                                    title_tokens = set(re.split(r'\s+', re.sub(r'[^a-z0-9]', ' ', title)))
+                                    file_tokens = set(re.split(r'\s+', file_key))
+                                    inter = len(title_tokens & file_tokens)
+                                    score += inter * 8
+                                    ry = (res.get('release_date','')[:4]) or (res.get('first_air_date','')[:4])
+                                    if year and ry and str(year) == ry:
+                                        score += 25
+                                    if file_key.strip() and file_key.strip() in title:
+                                        score += 10
+                                    return score
+                                except Exception:
+                                    return 0
+
+                            best = None
+                            best_score = -1
+                            for r in results:
+                                s = score_movie_result(base, r)
+                                if s > best_score:
+                                    best_score = s
+                                    best = r
+                            if best:
+                                poster_path = best.get('poster_path') or best.get('backdrop_path')
+                    except Exception:
+                        poster_path = None
+
+                    # cache even if None to avoid repeated failed lookups
+                    try:
+                        self.tmdb_response_cache[cache_key] = poster_path
+                    except Exception:
+                        pass
+
+                if poster_path:
+                    # use poster loader which will cache on disk
+                    try:
+                        self.load_poster_async(label, poster_path, "🎬")
+                        return
+                    except Exception:
+                        pass
+
+                # fallback: try to use local poster/backdrop cache or ffmpeg thumbnail (existing logic)
+                try:
+                    # local poster match
+                    base_name = os.path.splitext(os.path.basename(file_path))[0].lower()
+                    key = re.sub(r'[^a-z0-9]', '', base_name)
+                    found = False
+                    for fname in os.listdir(POSTER_CACHE_DIR):
+                        fn_lower = fname.lower()
+                        if key and (key in fn_lower or base_name in fn_lower):
+                            ppath = os.path.join(POSTER_CACHE_DIR, fname)
+                            if os.path.exists(ppath):
+                                tmp = QPixmap(ppath)
+                                if not tmp.isNull():
+                                    label.setPixmap(tmp.scaled(label.width(), label.height(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                                    found = True
+                                    break
+                    if found:
+                        return
+                except Exception:
+                    pass
+
+                # try backdrop cache
+                try:
+                    for fname in os.listdir(BACKDROP_CACHE_DIR):
+                        fn_lower = fname.lower()
+                        if key and (key in fn_lower or base_name in fn_lower or fn_lower.endswith('_ep.jpg')):
+                            ppath = os.path.join(BACKDROP_CACHE_DIR, fname)
+                            if os.path.exists(ppath):
+                                tmp = QPixmap(ppath)
+                                if not tmp.isNull():
+                                    label.setPixmap(tmp.scaled(label.width(), label.height(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                                    return
+                except Exception:
+                    pass
+
+                # fallback to thumbnail generation
+                try:
+                    thumb = self.get_thumbnail_cache_path(file_path)
+                    if os.path.exists(thumb):
+                        tp = QPixmap(thumb)
+                        if not tp.isNull():
+                            label.setPixmap(tp.scaled(label.width(), label.height(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                            return
+                    ff = shutil.which('ffmpeg') if shutil else None
+                    if ff:
+                        def _gen():
+                            try:
+                                self.generate_thumbnail(file_path, thumb)
+                                if os.path.exists(thumb):
+                                    def _set():
+                                        try:
+                                            tpx = QPixmap(thumb)
+                                            if not tpx.isNull():
+                                                label.setPixmap(tpx.scaled(label.width(), label.height(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                                        except Exception:
+                                            pass
+                                    try:
+                                        QTimer.singleShot(0, _set)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        try:
+                            import threading
+                            threading.Thread(target=_gen, daemon=True).start()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            except Exception:
+                logging.exception('tmdb lookup failed')
+
+        # build grid
+        for rec in records:
+            try:
+                card = QFrame()
+                card.setStyleSheet('background: #141414; border-radius:8px;')
+                card.setFixedSize(220, 300)
+                cl = QVBoxLayout(card)
+                cl.setContentsMargins(8, 8, 8, 8)
+                cl.setSpacing(6)
+
+                poster_label = QLabel()
+                poster_label.setFixedSize(200, 220)
+                poster_label.setStyleSheet('background:#222; border-radius:6px;')
+                poster_label.setAlignment(Qt.AlignCenter)
+                poster_label.setText('🎬')
+                cl.addWidget(poster_label, alignment=Qt.AlignCenter)
+
+                title_label = QLabel(rec.get('title') or '')
+                title_label.setWordWrap(True)
+                title_label.setFixedHeight(36)
+                title_label.setStyleSheet('font-size:13px; font-weight:600; color:white;')
+                cl.addWidget(title_label)
+
+                meta = rec.get('meta')
+                meta_str = ''
+                if isinstance(meta, (int, float)):
+                    try:
+                        meta_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(meta))
+                    except Exception:
+                        meta_str = ''
+                meta_label = QLabel(meta_str)
+                meta_label.setStyleSheet('font-size:11px; color:#BBBBBB;')
+                cl.addWidget(meta_label)
+
+                open_btn = QPushButton('Open')
+                open_btn.setCursor(Qt.PointingHandCursor)
+                open_btn.setStyleSheet('QPushButton { background:#E50914; color:white; padding:6px 10px; border-radius:5px; }')
+                open_btn.clicked.connect(lambda _, p=rec.get('path'): self.play_media_path(p))
+                cl.addWidget(open_btn, alignment=Qt.AlignCenter)
+
+                grid_layout.addWidget(card, row, col)
+                col += 1
+                if col >= cols:
+                    col = 0
+                    row += 1
+
+                # Start lookup in background (do not block UI)
+                try:
+                    QTimer.singleShot(20, lambda lbl=poster_label, fp=rec.get('path'): lookup_and_set_poster(lbl, fp))
+                except Exception:
+                    try:
+                        threading.Thread(target=lookup_and_set_poster, args=(poster_label, rec.get('path')), daemon=True).start()
+                    except Exception:
+                        pass
+
+            except Exception:
+                logging.exception('Error building recent grid card')
+
+        layout.addWidget(grid_container)
+        return widget
+
+    def _build_recently_watched_list(self, records):
+        """Build a simple text-only Recently Watched list (no images)."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        for rec in records:
+            try:
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(8, 6, 8, 6)
+                row_layout.setSpacing(12)
+
+                title_label = QLabel(rec.get('title') or os.path.basename(rec.get('path') or ''))
+                title_label.setStyleSheet('font-size:14px; font-weight:600; color: white;')
+                title_label.setWordWrap(False)
+                row_layout.addWidget(title_label, 1)
+
+                meta = rec.get('meta')
+                meta_str = ''
+                if isinstance(meta, (int, float)):
+                    try:
+                        meta_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(meta))
+                    except Exception:
+                        meta_str = ''
+                meta_label = QLabel(meta_str)
+                meta_label.setStyleSheet('font-size:12px; color:#BBBBBB;')
+                row_layout.addWidget(meta_label)
+
+                open_btn = QPushButton('Open')
+                open_btn.setCursor(Qt.PointingHandCursor)
+                open_btn.setStyleSheet('QPushButton { background:#E50914; color:white; padding:6px 10px; border-radius:5px; }')
+                open_btn.clicked.connect(lambda _, p=rec.get('path'): self.play_media_path(p))
+                row_layout.addWidget(open_btn)
+
+                # Stream button removed for Recently Watched (text-only list)
+
+                layout.addWidget(row)
+
+                sep = QFrame()
+                sep.setFixedHeight(1)
+                sep.setStyleSheet('background:#222;')
+                layout.addWidget(sep)
+            except Exception:
+                logging.exception('Error building recently watched row')
+
+        layout.addStretch()
+        return container
+
+    def _enable_wheel_scrolling(self, scroll_area):
+        """Install an event filter so mouse wheel events work even while images load."""
+        try:
+            # Define a lightweight event filter object that forwards wheel events
+            class _WheelForwarder(QObject):
+                def __init__(self, sa, parent=None):
+                    super().__init__(parent)
+                    self.sa = sa
+
+                def eventFilter(self, obj, event):
+                    try:
+                        if event.type() == QEvent.Wheel:
+                            sb = self.sa.verticalScrollBar()
+                            # angleDelta returns QPoint; use y for vertical
+                            delta = event.angleDelta().y()
+                            # In Qt, positive delta scrolls up; subtracting moves accordingly
+                            # Scale the delta down to avoid overly large jumps
+                            step = int(delta / 8) if abs(delta) >= 8 else (1 if delta > 0 else -1)
+                            new_val = sb.value() - step
+                            sb.setValue(new_val)
+                            # consume the event so default handlers do not double-process
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+            wf = _WheelForwarder(scroll_area)
+
+            # Ensure the scroll area can accept focus so it receives wheel events
+            try:
+                scroll_area.setFocusPolicy(Qt.StrongFocus)
+            except Exception:
+                pass
+
+            # Install on both the scroll_area and its viewport so events are caught
+            try:
+                scroll_area.installEventFilter(wf)
+            except Exception:
+                pass
+            try:
+                v = scroll_area.viewport()
+                v.installEventFilter(wf)
+            except Exception:
+                pass
+
+            # Keep reference to prevent GC and allow multiple filters
+            if not hasattr(self, '_wheel_forwarders'):
+                self._wheel_forwarders = []
+            self._wheel_forwarders.append(wf)
+        except Exception:
+            pass
+
+    def get_thumbnail_cache_path(self, file_path):
+        try:
+            os.makedirs(THUMBNAIL_CACHE_DIR, exist_ok=True)
+            h = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+            return os.path.join(THUMBNAIL_CACHE_DIR, f"{h}.jpg")
+        except Exception:
+            return os.path.join(THUMBNAIL_CACHE_DIR, os.path.basename(file_path) + '.jpg')
+
+    def generate_thumbnail(self, file_path, out_path, offset=10):
+        """Generate a thumbnail image using ffmpeg at `offset` seconds.
+
+        Returns True on success, False otherwise.
+        """
+        try:
+            ff = shutil.which('ffmpeg')
+            if not ff:
+                return False
+            # ensure output dir exists
+            od = os.path.dirname(out_path)
+            if od:
+                os.makedirs(od, exist_ok=True)
+
+            # Use ffmpeg to grab a frame at `offset` seconds
+            # -y overwrite, -ss before -i for fast seek
+            cmd = [ff, '-ss', str(offset), '-i', file_path, '-frames:v', '1', '-q:v', '2', '-y', out_path]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        except Exception:
+            logging.error('Error generating thumbnail:\n' + traceback.format_exc())
+            return False
+
+    def clear_recently_watched(self):
+        """Clear Recently Watched entries (DB last_watched) and temporarily ignore filesystem recency."""
+        try:
+            # Record clear timestamp to ignore filesystem and Windows Recent items older than this
+            self.recently_cleared_at = time.time()
+            try:
+                self.watch_status_manager.clear_all_last_watched()
+            except Exception:
+                logging.debug('Failed to clear DB last_watched')
+
+            # Refresh view
+            try:
+                self.refresh_recently_watched()
+            except Exception:
+                pass
+        except Exception:
+            logging.error('Error clearing Recently Watched:\n' + traceback.format_exc())
+
+    def show_playback_toast(self, file_path, progress=None, media_length=None, timeout=8000):
+        """Show a lightweight non-blocking toast with quick actions after playback ends.
+
+        - Mark watched: marks file as watched immediately
+        - Save resume: allow entering seconds to save resume progress (non-modal input inside toast)
+        """
+        try:
+            if not file_path or not os.path.exists(file_path):
+                return
+
+            # Remove any existing toast
+            try:
+                if hasattr(self, '_playback_toast') and self._playback_toast:
+                    try:
+                        self._playback_toast.deleteLater()
+                    except Exception:
+                        pass
+                    self._playback_toast = None
+            except Exception:
+                pass
+
+            toast = QFrame(self)
+            toast.setObjectName('playback_toast')
+            toast.setStyleSheet('''
+                QFrame#playback_toast { background: rgba(30,30,30,230); border: 1px solid #333; border-radius: 8px; }
+                QLabel { color: white; }
+                QLineEdit { background: #222; color: white; border: 1px solid #444; padding: 4px; }
+                QPushButton { background: #E50914; color: white; border: none; padding: 6px 10px; border-radius:4px; }
+                QPushButton#close_toast { background: transparent; color: #BBBBBB; }
+            ''')
+            toast.setFixedSize(420, 72)
+
+            # Position bottom-right inside the main window
+            try:
+                toast.move(max(10, self.width() - toast.width() - 20), max(10, self.height() - toast.height() - 30))
+            except Exception:
+                toast.move(20, 20)
+
+            layout = QHBoxLayout(toast)
+            layout.setContentsMargins(10, 6, 10, 6)
+            layout.setSpacing(8)
+
+            label = QLabel(os.path.basename(file_path))
+            label.setStyleSheet('font-weight:600;')
+            layout.addWidget(label, 1)
+
+            time_edit = QLineEdit()
+            time_edit.setPlaceholderText('seconds')
+            time_edit.setFixedWidth(80)
+            layout.addWidget(time_edit)
+
+            save_btn = QPushButton('Save resume')
+            save_btn.setCursor(Qt.PointingHandCursor)
+            layout.addWidget(save_btn)
+
+            mark_btn = QPushButton('Mark watched')
+            mark_btn.setCursor(Qt.PointingHandCursor)
+            layout.addWidget(mark_btn)
+
+            close_btn = QPushButton('✕')
+            close_btn.setObjectName('close_toast')
+            close_btn.setCursor(Qt.PointingHandCursor)
+            close_btn.setFixedWidth(28)
+            layout.addWidget(close_btn)
+
+            # Keep reference so it can be removed later
+            self._playback_toast = toast
+
+            def _remove_toast():
+                try:
+                    if self._playback_toast:
+                        self._playback_toast.deleteLater()
+                        self._playback_toast = None
+                except Exception:
+                    pass
+
+            def on_mark():
+                try:
+                    self.watch_status_manager.mark_watched(file_path, watched=True, progress=1.0, media_length=media_length)
+                except Exception:
+                    logging.exception('Error marking watched from toast')
+                try:
+                    mark_btn.setText('Marked')
+                    QTimer.singleShot(600, _remove_toast)
+                    # update recently watched UI
+                    try:
+                        self.refresh_recently_watched()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            def on_save():
+                try:
+                    text = time_edit.text().strip()
+                    if text:
+                        try:
+                            secs = float(text)
+                        except Exception:
+                            secs = None
+                    else:
+                        secs = None
+
+                    if secs is None:
+                        # if we have previous progress, keep it; else store 0
+                        try:
+                            cur = self.watch_status_manager.get_status(file_path)
+                            if cur and cur.get('progress') is not None:
+                                prog = float(cur.get('progress'))
+                                self.watch_status_manager.update_progress(file_path, prog, media_length)
+                            else:
+                                self.watch_status_manager.update_progress(file_path, 0.0, media_length)
+                        except Exception:
+                            logging.exception('Error saving resume default')
+                    else:
+                        if media_length:
+                            prog = min(1.0, max(0.0, float(secs) / float(media_length)))
+                        else:
+                            # Without media_length we store seconds as 0..1 where 0 means unknown
+                            prog = 0.0
+                        self.watch_status_manager.update_progress(file_path, prog, media_length)
+
+                    save_btn.setText('Saved')
+                    QTimer.singleShot(800, _remove_toast)
+                    try:
+                        self.refresh_recently_watched()
+                    except Exception:
+                        pass
+                except Exception:
+                    logging.exception('Error saving resume from toast')
+
+            save_btn.clicked.connect(on_save)
+            mark_btn.clicked.connect(on_mark)
+            close_btn.clicked.connect(_remove_toast)
+
+            toast.show()
+            toast.raise_()
+
+            # auto-hide after timeout
+            try:
+                QTimer.singleShot(timeout, _remove_toast)
+            except Exception:
+                pass
+
+        except Exception:
+            logging.error('Error showing playback toast:\n' + traceback.format_exc())
+
+    def show_resume_prompt(self, file_path, start_seconds, percent, timeout_ms=2500):
+        """Show a short non-blocking resume prompt before launching playback.
+
+        Returns True if the user chose Resume within the timeout; False otherwise.
+        This uses a short QEventLoop that times out after `timeout_ms`.
+        """
+        try:
+            choice = {'resume': False}
+
+            prompt = QFrame(self)
+            prompt.setObjectName('resume_prompt')
+            prompt.setStyleSheet('''
+                QFrame#resume_prompt { background: rgba(30,30,30,220); border: 1px solid #333; border-radius: 8px; }
+                QLabel { color: white; }
+                QPushButton { background: #E50914; color: white; border: none; padding: 6px 10px; border-radius:4px; }
+            ''')
+            prompt.setFixedSize(380, 64)
+            try:
+                prompt.move(max(10, self.width() - prompt.width() - 20), max(10, self.height() - prompt.height() - 110))
+            except Exception:
+                prompt.move(20, 20)
+
+            lay = QHBoxLayout(prompt)
+            lay.setContentsMargins(10, 6, 10, 6)
+            lay.setSpacing(8)
+            lbl = QLabel(f"Resume {os.path.basename(file_path)} at {start_seconds}s? ({percent}%)")
+            lay.addWidget(lbl, 1)
+            resume_btn = QPushButton('Resume')
+            start_btn = QPushButton('Start from beginning')
+            lay.addWidget(resume_btn)
+            lay.addWidget(start_btn)
+
+            loop = QEventLoop()
+
+            def do_resume():
+                choice['resume'] = True
+                try:
+                    prompt.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    loop.quit()
+                except Exception:
+                    pass
+
+            def do_start():
+                choice['resume'] = False
+                try:
+                    prompt.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    loop.quit()
+                except Exception:
+                    pass
+
+            resume_btn.clicked.connect(do_resume)
+            start_btn.clicked.connect(do_start)
+
+            prompt.show()
+            prompt.raise_()
+
+            # timeout to auto-continue
+            QTimer.singleShot(timeout_ms, lambda: loop.quit())
+
+            # Run event loop (short) to wait for user's choice or timeout
+            try:
+                loop.exec_()
+            except Exception:
+                pass
+
+            try:
+                prompt.deleteLater()
+            except Exception:
+                pass
+
+            return bool(choice.get('resume'))
+        except Exception:
+            logging.error('Error showing resume prompt:\n' + traceback.format_exc())
+            return False
+
+    def play_media_path(self, path):
+        try:
+            if not path:
+                return
+            class DummyItem:
+                def __init__(self, fp):
+                    self.file_path = fp
+                    self._text = fp
+                def text(self):
+                    return self._text
+            self.play_media(DummyItem(path))
+        except Exception:
+            logging.error('Error launching media from Recently Watched tab:\n' + traceback.format_exc())
 
     def handle_search_input_changed(self, text):
         """Handle changes in the search input field"""
@@ -5985,7 +7039,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         trailer_button.clicked.connect(lambda: self.watch_series_trailer(series_data))
         buttons_layout.addWidget(trailer_button)
 
-        # Stream button for series (open web search on fmovies)
+        # Stream button for series (open web search on yflix)
         stream_button = QPushButton("Stream")
         stream_button.setStyleSheet("""
             QPushButton {
@@ -6004,7 +7058,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 color: white;
             }
         """)
-        stream_button.clicked.connect(lambda: self.open_fmovies_search(series_data.get("name", "")))
+        stream_button.clicked.connect(lambda: self.open_yflix_search(series_data.get("name", "")))
         buttons_layout.addWidget(stream_button)
         
         buttons_layout.addStretch()
@@ -6021,6 +7075,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     container_layout.addWidget(more_widget)
         except Exception:
             pass
+        # Enable wheel scrolling while images load
+        try:
+            self._enable_wheel_scrolling(scroll_area)
+        except Exception:
+            pass
+
         # Set up scroll area and add to main layout
         scroll_area.setWidget(container)
         self.home_details_layout.addWidget(scroll_area)
@@ -6305,7 +7365,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         trailer_button.clicked.connect(lambda: self.watch_trailer(movie_data))
         buttons_layout.addWidget(trailer_button)
 
-        # Stream button (open web search on fmovies)
+        # Stream button (open web search on yflix)
         stream_button = QPushButton("Stream")
         stream_button.setStyleSheet("""
             QPushButton {
@@ -6325,7 +7385,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             }
         """)
         # Use release year when available to narrow search
-        stream_button.clicked.connect(lambda: self.open_fmovies_search(movie_data.get("title", "")))
+        stream_button.clicked.connect(lambda: self.open_yflix_search(movie_data.get("title", "")))
         buttons_layout.addWidget(stream_button)
         
         buttons_layout.addStretch()
@@ -6342,6 +7402,12 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     container_layout.addWidget(more_widget)
         except Exception:
             pass
+        # Enable wheel scrolling while images load
+        try:
+            self._enable_wheel_scrolling(scroll_area)
+        except Exception:
+            pass
+
         # Set up scroll area and add to main layout
         scroll_area.setWidget(container)
         self.home_details_layout.addWidget(scroll_area)
@@ -6378,18 +7444,31 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             logging.error(f"Error opening trailer: {str(e)}")
             QMessageBox.critical(self, "Error", f"Could not open trailer:\n{str(e)}")
 
-    def open_fmovies_search(self, title, year=None):
-        """Open an fmovies search URL for the given title (movie or series)."""
+    def open_yflix_search(self, title, year=None):
+        """Open a yflix search URL for the given title (movie or series)."""
         try:
             if not title:
                 return
-            # Build a clean query: lowercase, strip punctuation, use + for spaces
-            import re
-            clean = re.sub(r'[^0-9a-zA-Z ]+', '', title).strip().lower()
-            if not clean:
-                return
-            q = clean.replace(' ', '+')
-            url = f"https://ww4.fmovies.co/search/?q={q}"
+            # Strip trailing year (e.g. "(2020)", "- 2020", " 2020") from title before searching
+            try:
+                import re
+                # Remove trailing year tokens like '(2020)', '- 2020', ' 2020' at end of string
+                cleaned = re.sub(r"[\s\(\[\-]*(?:19|20)\d{2}[\)\]\s\-]*$", "", title).strip()
+                # Remove problematic punctuation while keeping letters/numbers/spaces
+                cleaned = re.sub(r"[^0-9A-Za-z ]+", "", cleaned).strip()
+                if not cleaned:
+                    cleaned = title
+            except Exception:
+                cleaned = title
+
+            # Use urllib.parse.quote_plus to encode the keyword
+            try:
+                q = quote_plus(cleaned)
+            except Exception:
+                # fallback: simple replace
+                q = cleaned.replace(' ', '+')
+
+            url = f"https://yflix.to/browser?keyword={q}"
 
             # Open in default browser cross-platform
             if sys.platform == "win32":
@@ -6399,9 +7478,9 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             else:
                 subprocess.run(["xdg-open", url])
 
-            logging.info(f"Opening fmovies search for: {clean}")
+            logging.info(f"Opening yflix search for: {cleaned}")
         except Exception as e:
-            logging.error(f"Error opening fmovies search: {e}")
+            logging.error(f"Error opening yflix search: {e}")
             QMessageBox.critical(self, "Error", f"Could not open stream search:\n{str(e)}")
 
     def create_media_view(self, title):
@@ -6645,7 +7724,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.series_filter_combo.addItem("Music")
         self.series_filter_combo.addItem("History")
         self.series_filter_combo.addItem("Western")
-        self.series_filter_combo.addItem("News")
+
         self.series_filter_combo.addItem("Talk Shows")
         self.series_filter_combo.currentTextChanged.connect(self.filter_series)
         search_filter_layout.addWidget(self.series_filter_combo)
@@ -6827,6 +7906,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             batch_size = 10
             start = getattr(self, '_series_batch_index', 0)
             end = min(start + batch_size, len(getattr(self, 'series_dirs_list', [])))
+            # (no series-level bookmark preloading; bookmarks are per-episode)
             for idx in range(start, end):
                 series_name, series_path = self.series_dirs_list[idx]
                 item = QListWidgetItem(series_name)
@@ -6963,6 +8043,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             os.makedirs(SYNOPSIS_CACHE_DIR, exist_ok=True)
             with open(meta_path, 'w', encoding='utf-8') as f:
                 f.write(f"{imdb_rating}|{','.join(genres_named)}|{release_year}")
+            
                 
         except Exception as e:
             logging.error(f"Error loading metadata for {series_path}: {str(e)}")
@@ -7233,11 +8314,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             except Exception:
                 pass
 
-            # Batch-query watched status to avoid per-item DB calls and possible errors
-            try:
-                watched_set = self.watch_status_manager.get_watched_files(episodes)
-            except Exception:
-                watched_set = set()
+            # Do not query watched status here (opt-out of automatic watched checks)
+            watched_set = set()
 
             for file_path in sorted(episodes):
                 file = os.path.basename(file_path)
@@ -7282,21 +8360,45 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     ep_layout.setAlignment(Qt.AlignVCenter)
                     ep_layout.addStretch()  # push status indicator to the far right
 
-                    # Add watched status indicator (simple green dot)
-                    status_indicator = QLabel()
-                    status_indicator.setFixedSize(12, 12)
-                    status_indicator.setStyleSheet("background-color: #00FF00; border-radius: 6px;")
-                    watched = file_path in watched_set
-                    status_indicator.setVisible(watched)
+                    # Add bookmark indicator (shows if this episode is bookmarked)
+                    # Use a QPushButton so the icon in the episode list is clickable
+                    bookmark_label = QPushButton()
+                    bookmark_label.setFlat(True)
+                    bookmark_label.setCursor(Qt.PointingHandCursor)
+                    bookmark_label.setFixedSize(18, 18)
+                    bookmark_label.setStyleSheet("border: none; background: transparent;")
+                    try:
+                        bookmarked = bool(self.watch_status_manager.is_bookmarked(file_path))
+                        pix = None
+                        if bookmarked and getattr(self, 'bookmark_pixmap_ticked', None) is not None:
+                            pix = self.bookmark_pixmap_ticked
+                        elif not bookmarked and getattr(self, 'bookmark_pixmap_unticked', None) is not None:
+                            pix = self.bookmark_pixmap_unticked
 
-                    # place inside a fixed-width container and center vertically
+                        if pix is not None:
+                            bookmark_label.setIcon(QIcon(pix))
+                            bookmark_label.setIconSize(pix.size())
+                            bookmark_label.setVisible(True)
+                        else:
+                            bookmark_label.setVisible(False)
+                    except Exception:
+                        bookmark_label.setVisible(False)
+
+                    # connect to the shared toggle factory
+                    bookmark_label.clicked.connect(self._list_toggle_factory(file_path))
+
                     status_wrapper = QWidget()
                     sw_layout = QHBoxLayout(status_wrapper)
                     sw_layout.setContentsMargins(0, 0, 0, 0)
                     sw_layout.setAlignment(Qt.AlignCenter)
-                    sw_layout.addWidget(status_indicator)
+                    sw_layout.addWidget(bookmark_label)
                     status_wrapper.setFixedWidth(28)
                     ep_layout.addWidget(status_wrapper, 0, alignment=Qt.AlignVCenter | Qt.AlignRight)
+
+                    # keep references on the widget so we can update bookmark indicator in-place
+                    episode_widget.bookmark_label = bookmark_label
+                    episode_widget.file_path = file_path
+
                     episode_widget.setStyleSheet("background-color: #232323; border-radius: 6px;")
                     episode_widget.mousePressEvent = lambda e, ep=episode_item, sp=series_path: self.show_episode_details(ep, parent_series_path=sp)
                     episode_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -7322,10 +8424,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             self.stacked_widget.setCurrentIndex(3)
         except Exception as e:
             logging.error("Error in show_series_episodes:\n" + traceback.format_exc())
-            try:
-                QMessageBox.critical(self, "Error", f"Failed to open series:\n{e}")
-            except Exception:
-                logging.error("Also failed to show error dialog")
+            logging.error("Also failed to show series - continuing silently")
             return
         
     def show_season_episodes(self, series_path, season):
@@ -7371,11 +8470,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
 
             episodes = self.get_episodes_for_series(series_path, season=season)
 
-            # Batch-query watched status
-            try:
-                watched_set = self.watch_status_manager.get_watched_files(episodes)
-            except Exception:
-                watched_set = set()
+            # Do not query watched status here (opt-out of automatic watched checks)
+            watched_set = set()
 
             displayed_episodes = set()
             for file_path in sorted(episodes):
@@ -7417,19 +8513,43 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                     ep_layout.setAlignment(Qt.AlignVCenter)
                     ep_layout.addStretch()
 
-                    status_indicator = QLabel()
-                    status_indicator.setFixedSize(12, 12)
-                    status_indicator.setStyleSheet("background-color: #00FF00; border-radius: 6px;")
-                    watched = file_path in watched_set
-                    status_indicator.setVisible(watched)
+                    # Add bookmark indicator (shows if this episode is bookmarked)
+                    # Use a clickable button in the compact season-update view as well
+                    bookmark_label = QPushButton()
+                    bookmark_label.setFlat(True)
+                    bookmark_label.setCursor(Qt.PointingHandCursor)
+                    bookmark_label.setFixedSize(18, 18)
+                    bookmark_label.setStyleSheet("border: none; background: transparent;")
+                    try:
+                        bookmarked = bool(self.watch_status_manager.is_bookmarked(file_path))
+                        pix = None
+                        if bookmarked and getattr(self, 'bookmark_pixmap_ticked', None) is not None:
+                            pix = self.bookmark_pixmap_ticked
+                        elif not bookmarked and getattr(self, 'bookmark_pixmap_unticked', None) is not None:
+                            pix = self.bookmark_pixmap_unticked
+
+                        if pix is not None:
+                            bookmark_label.setIcon(QIcon(pix))
+                            bookmark_label.setIconSize(pix.size())
+                            bookmark_label.setVisible(True)
+                        else:
+                            bookmark_label.setVisible(False)
+                    except Exception:
+                        bookmark_label.setVisible(False)
+
+                    bookmark_label.clicked.connect(self._list_toggle_factory(file_path))
 
                     status_wrapper = QWidget()
                     sw_layout = QHBoxLayout(status_wrapper)
                     sw_layout.setContentsMargins(0, 0, 0, 0)
                     sw_layout.setAlignment(Qt.AlignCenter)
-                    sw_layout.addWidget(status_indicator)
+                    sw_layout.addWidget(bookmark_label)
                     status_wrapper.setFixedWidth(28)
                     ep_layout.addWidget(status_wrapper, 0, alignment=Qt.AlignVCenter | Qt.AlignRight)
+                    # keep references so helper can update the icon in-place
+                    episode_widget.bookmark_label = bookmark_label
+                    episode_widget.file_path = file_path
+
                     episode_widget.setStyleSheet("background-color: #232323; border-radius: 6px;")
                     episode_widget.mousePressEvent = lambda e, ep=episode_item, sp=series_path: self.show_episode_details(ep, parent_series_path=sp)
                     episode_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -7439,6 +8559,91 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             layout.addStretch()
         except Exception:
             logging.error("Error updating episodes for season:\n" + traceback.format_exc())
+
+    def update_episode_bookmark_indicator(self, file_path, visible):
+        """Find the episode widget(s) for `file_path` in the current episodes layout and toggle the bookmark label visibility in-place."""
+        try:
+            layout = getattr(self, 'current_episodes_list_layout', None)
+            if layout is None:
+                return
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item is None:
+                    continue
+                widget = item.widget()
+                if widget is None:
+                    continue
+                try:
+                    if getattr(widget, 'file_path', None) == file_path:
+                        bl = getattr(widget, 'bookmark_label', None)
+                        if bl is not None:
+                            # visible here indicates bookmarked status
+                            bookmarked = bool(visible)
+                            pix = None
+                            if bookmarked and getattr(self, 'bookmark_pixmap_ticked', None) is not None:
+                                pix = self.bookmark_pixmap_ticked
+                            elif not bookmarked and getattr(self, 'bookmark_pixmap_unticked', None) is not None:
+                                pix = self.bookmark_pixmap_unticked
+
+                            if pix is not None:
+                                # handle QPushButton icon or QLabel pixmap
+                                if isinstance(bl, QPushButton):
+                                    bl.setIcon(QIcon(pix))
+                                    bl.setIconSize(pix.size())
+                                    bl.setVisible(True)
+                                else:
+                                    bl.setPixmap(pix)
+                                    bl.setVisible(True)
+                            else:
+                                try:
+                                    if isinstance(bl, QPushButton):
+                                        bl.setIcon(QIcon())
+                                        bl.setVisible(False)
+                                    else:
+                                        bl.clear()
+                                        bl.setVisible(False)
+                                except Exception:
+                                    pass
+                except Exception:
+                    continue
+        except Exception:
+            logging.error("Error updating episode bookmark indicator:\n" + traceback.format_exc())
+
+    def _list_toggle_factory(self, fp):
+        """Return a function that toggles bookmark for fp and updates UI (list + details)"""
+        def _toggle():
+            try:
+                if self.watch_status_manager.is_bookmarked(fp):
+                    self.watch_status_manager.remove_bookmark(fp)
+                    try:
+                        self.update_episode_bookmark_indicator(fp, False)
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, 'current_details_file_path', None) == fp and getattr(self, 'current_details_bookmark_btn', None) is not None:
+                            bbtn = self.current_details_bookmark_btn
+                            if getattr(self, 'bookmark_pixmap_unticked', None) is not None:
+                                bbtn.setIcon(QIcon(self.bookmark_pixmap_unticked))
+                                bbtn.setIconSize(self.bookmark_pixmap_unticked.size())
+                    except Exception:
+                        pass
+                else:
+                    self.watch_status_manager.add_bookmark(fp)
+                    try:
+                        self.update_episode_bookmark_indicator(fp, True)
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, 'current_details_file_path', None) == fp and getattr(self, 'current_details_bookmark_btn', None) is not None:
+                            bbtn = self.current_details_bookmark_btn
+                            if getattr(self, 'bookmark_pixmap_ticked', None) is not None:
+                                bbtn.setIcon(QIcon(self.bookmark_pixmap_ticked))
+                                bbtn.setIconSize(self.bookmark_pixmap_ticked.size())
+                    except Exception:
+                        pass
+            except Exception:
+                logging.exception("Error toggling bookmark from list")
+        return _toggle
 
     def get_seasons_list(self, series_path):
         # Use cached scan results if available
@@ -8334,8 +9539,25 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         self.current_file_index = end_index
         
         # Update progress if we have a progress indicator
+        total_files = len(self.media_files)
+        if total_files == 0:
+            # Nothing to process — mark loading complete and avoid division by zero
+            if hasattr(self, 'loading_progress'):
+                try:
+                    self.loading_progress.setValue(100)
+                except Exception:
+                    pass
+            self.media_lists_loaded = True
+            self.media_loading_in_progress = False
+            self.hide_loading_in_movies_tab()
+            return
+
         if hasattr(self, 'loading_progress'):
-            progress = int((self.current_file_index / len(self.media_files)) * 100)
+            # Safely calculate progress
+            try:
+                progress = int((self.current_file_index / float(total_files)) * 100)
+            except Exception:
+                progress = 0
             self.loading_progress.setValue(progress)
         
         # Continue processing if there are more files
@@ -9223,85 +10445,144 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
             if not file_path:
                 return
 
+            # Helper: detect an installed player that supports start-time
+            def detect_seekable_player():
+                # Prefer mpv, then vlc
+                try:
+                    from shutil import which
+                    if which('mpv'):
+                        return ('mpv', which('mpv'))
+                    if which('vlc'):
+                        return ('vlc', which('vlc'))
+                except Exception:
+                    pass
+                return (None, None)
+
+            # Helper: try to obtain media duration (seconds) via ffprobe if available
+            def get_media_duration_seconds(path):
+                try:
+                    from shutil import which
+                    ffprobe = which('ffprobe')
+                    if not ffprobe:
+                        return None
+                    cmd = [ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path]
+                    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+                    s = out.decode('utf-8', errors='ignore').strip()
+                    if not s:
+                        return None
+                    return float(s)
+                except Exception:
+                    return None
+
+            # Check saved status
+            try:
+                status = self.watch_status_manager.get_status(file_path)
+            except Exception:
+                status = None
+
+            # If we have a saved progress and media_length, offer resume
+            start_seconds = None
+            player_kind, player_path = detect_seekable_player()
+            if status and status.get('progress') and status.get('media_length'):
+                try:
+                    prog = float(status.get('progress') or 0.0)
+                    media_len = status.get('media_length')
+                    if media_len and prog > 0 and prog < 0.99:
+                        start_seconds = int(prog * float(media_len))
+                        # Offer a short non-blocking resume prompt (auto-continues after timeout)
+                        try:
+                            resume = self.show_resume_prompt(file_path, start_seconds, int(prog * 100), timeout_ms=2500)
+                        except Exception:
+                            resume = False
+                    else:
+                        resume = False
+                except Exception:
+                    resume = False
+            else:
+                resume = False
+
             played_to_end = False
 
-            # Platform-specific launch that waits for player to exit when possible
+            # Launch with resume if requested and supported
             try:
-                if sys.platform == "win32":
-                    # Use cmd start /WAIT to wait for the associated application to close
-                    subprocess.run(f'start "" /WAIT "{file_path}"', shell=True)
-                    played_to_end = True
-                elif sys.platform == "darwin":
-                    # open -W waits until the app is closed
-                    subprocess.run(["open", "-W", file_path])
-                    played_to_end = True
+                if resume and player_kind:
+                    if player_kind == 'mpv':
+                        cmd = [player_path, f'--start={start_seconds}', file_path]
+                        subprocess.run(cmd)
+                        played_to_end = True
+                    elif player_kind == 'vlc':
+                        # vlc uses --start-time
+                        cmd = [player_path, '--play-and-exit', f'--start-time={start_seconds}', file_path]
+                        subprocess.run(cmd)
+                        played_to_end = True
+                    else:
+                        # fallback to default open if player not supported
+                        if sys.platform == 'win32':
+                            subprocess.run(f'start "" /WAIT "{file_path}"', shell=True)
+                            played_to_end = True
+                        elif sys.platform == 'darwin':
+                            subprocess.run(["open", "-W", file_path])
+                            played_to_end = True
+                        else:
+                            subprocess.Popen(["xdg-open", file_path])
+                            played_to_end = False
                 else:
-                    # xdg-open doesn't wait reliably; fall back to launching and ask the user after
-                    subprocess.Popen(["xdg-open", file_path])
-                    played_to_end = False
+                    # Normal launch (try to wait where possible)
+                    if sys.platform == "win32":
+                        subprocess.run(f'start "" /WAIT "{file_path}"', shell=True)
+                        played_to_end = True
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", "-W", file_path])
+                        played_to_end = True
+                    else:
+                        subprocess.Popen(["xdg-open", file_path])
+                        played_to_end = False
             except Exception as e:
                 logging.warning(f"Could not launch with wait semantics: {e}")
                 # fallback to generic open
                 try:
                     if sys.platform == "win32":
                         os.startfile(file_path)
+                        played_to_end = False
                     elif sys.platform == "darwin":
                         subprocess.run(["open", file_path])
+                        played_to_end = True
                     else:
                         subprocess.Popen(["xdg-open", file_path])
+                        played_to_end = False
                 except Exception as e2:
                     logging.error(f"Error launching media file: {e2}")
                     QMessageBox.critical(self, "Error", f"Could not play media file:\n{e2}")
                     return
 
-            # If we were able to wait for the process, ask whether to mark watched
+            # Post-playback: user requested no modal prompts. We no longer show dialogs
+            # asking whether the file was finished; bookmarks or explicit actions can
+            # be used by the user to mark watched or save resume positions.
             try:
-                # Only allow marking as watched when the user is in the Series tab
-                series_tab_active = getattr(self, 'active_tab', None) == getattr(self, 'series_button', None)
-                if not series_tab_active:
-                    # Do not prompt or mark when not in Series tab
-                    logging.debug("Skipping mark-as-watched prompt because Series tab is not active")
-                else:
-                    mark_now = False
-                    if played_to_end:
-                        # Confirm with the user before marking; they may have closed early
-                        resp = QMessageBox.question(self, "Mark as watched?", "The player closed. Mark this file as watched?", QMessageBox.Yes | QMessageBox.No)
-                        mark_now = (resp == QMessageBox.Yes)
-                    else:
-                        # Could not detect playback end; ask user whether to mark it now
-                        resp = QMessageBox.question(self, "Mark as watched?", "Did you finish watching this file and want to mark it as watched now?", QMessageBox.Yes | QMessageBox.No)
-                        mark_now = (resp == QMessageBox.Yes)
-
-                    if mark_now:
+                logging.debug("Post-playback: skipping interactive prompts as configured")
+                # Update the DB last_watched timestamp so Recently Watched ordering reflects this play
+                try:
+                    try:
+                        self.watch_status_manager.touch_last_watched(file_path)
+                    except Exception:
+                        logging.debug('Could not touch last_watched')
+                    # Refresh Recently Watched view asynchronously
+                    try:
+                        QTimer.singleShot(200, lambda: self.refresh_recently_watched())
+                    except Exception:
                         try:
-                            self.watch_status_manager.mark_as_watched(file_path)
-                            logging.info(f"Marked as watched: {file_path}")
-                            # Refresh series episodes view if currently viewing this series
-                            if getattr(self, 'current_series_data', None):
-                                # If the current series matches the file's series path, refresh
-                                parent_series = os.path.dirname(file_path)
-                                # If file is inside a Season folder, go one level up to series root
-                                if os.path.basename(parent_series).lower().startswith('season'):
-                                    series_root = os.path.dirname(parent_series)
-                                else:
-                                    series_root = parent_series
-                                try:
-                                    current_series = self.current_series_data
-                                    # Compare normalized absolute paths when possible
-                                    if current_series:
-                                        try:
-                                            if os.path.abspath(current_series) == os.path.abspath(series_root):
-                                                self.show_series_episodes(self._make_series_item(current_series))
-                                        except Exception:
-                                            # fallback to basename compare
-                                            if os.path.basename(current_series) == os.path.basename(series_root):
-                                                self.show_series_episodes(self._make_series_item(current_series))
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logging.error(f"Error marking watched after playback: {e}")
+                            self.refresh_recently_watched()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # Post-playback toast removed by user request; bookmarks and manual actions handle marking/saving
             except Exception as e:
-                logging.error(f"Error handling post-playback confirmation: {e}")
+                logging.error(f"Error in post-playback noop: {e}")
+
+            # Do not automatically navigate back to the episodes list after playback.
+            # The UI should remain where the user left it; bookmarks or manual actions
+            # are used to mark watched status or refresh lists.
 
         except Exception as e:
             logging.error(f"Error playing media file: {str(e)}")
@@ -9402,7 +10683,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     def delete_series(self, series_path, series_name):
         try:
             if not os.path.exists(series_path):
-                QMessageBox.critical(self, "Error", "Series folder not found.")
+                logging.error("Series folder not found")
                 return
 
             # Count total files in the series
@@ -9475,7 +10756,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 self.stacked_widget.setCurrentIndex(2)  # Series list view
         except Exception as e:
             logging.error(f"Error deleting series: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Could not delete series:\n{str(e)}")
 
     def show_movies_context_menu(self, position):
         item = self.movies_list.itemAt(position)

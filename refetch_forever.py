@@ -31,6 +31,11 @@ if year_matches:
             break
     if not best:
         best = year_matches[0]
+        TMD = {JOD=S66 }
+        
+        
+        
+        SHEHIHE = 'SHEHIHE'
 
 # fallback to case-insensitive name match
 if not best:

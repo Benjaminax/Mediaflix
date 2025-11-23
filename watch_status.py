@@ -23,9 +23,103 @@ class WatchStatusManager:
                         media_length INTEGER
                     )
                 ''')
+                # Index to speed up recently-watched queries
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_watch_status_last_watched ON watch_status(last_watched)')
+                # Bookmarks table to store user bookmarks for episodes/files
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS bookmarks (
+                        file_path TEXT PRIMARY KEY,
+                        created TEXT,
+                        note TEXT
+                    )
+                ''')
                 conn.commit()
         except Exception as e:
             logging.error(f"Error initializing watch status database: {str(e)}")
+
+    # Bookmark methods
+    def add_bookmark(self, file_path, note=None):
+        """Add or update a bookmark for a file."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO bookmarks (file_path, created, note)
+                    VALUES (?, ?, ?)
+                ''', (file_path, datetime.now().isoformat(), note))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error adding bookmark: {str(e)}")
+
+    def remove_bookmark(self, file_path):
+        """Remove a bookmark for a file."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM bookmarks WHERE file_path = ?', (file_path,))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error removing bookmark: {str(e)}")
+
+    def is_bookmarked(self, file_path):
+        """Return True if file is bookmarked."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM bookmarks WHERE file_path = ? LIMIT 1', (file_path,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logging.error(f"Error checking bookmark: {str(e)}")
+            return False
+
+    def get_bookmarks(self):
+        """Return a list of bookmark records as dicts."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT file_path, created, note FROM bookmarks ORDER BY created DESC')
+                rows = cursor.fetchall()
+                return [{'file_path': r[0], 'created': r[1], 'note': r[2]} for r in rows]
+        except Exception as e:
+            logging.error(f"Error getting bookmarks: {str(e)}")
+            return []
+
+    def get_recently_watched(self, limit=12):
+        """Return a list of recently watched files ordered by last_watched desc.
+        Each item is a dict with 'file_path' and 'last_watched'.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT file_path, last_watched FROM watch_status
+                    WHERE last_watched IS NOT NULL
+                    ORDER BY last_watched DESC
+                    LIMIT ?
+                ''', (limit,))
+                rows = cursor.fetchall()
+                result = []
+                for r in rows:
+                    fp = r[0]
+                    ts = r[1]
+                    # Only include files that still exist on disk
+                    if not os.path.exists(fp):
+                        continue
+                    # Parse ISO timestamp into epoch seconds for consistent display
+                    try:
+                        dt = datetime.fromisoformat(ts)
+                        epoch = dt.timestamp()
+                    except Exception:
+                        try:
+                            # fallback: attempt to parse common formats
+                            epoch = float(ts)
+                        except Exception:
+                            epoch = None
+                    result.append({'file_path': fp, 'last_watched': epoch})
+                return result
+        except Exception as e:
+            logging.error(f"Error getting recently watched: {str(e)}")
+            return []
 
     def mark_watched(self, file_path, watched=True, progress=1.0, media_length=None):
         """Mark a file as watched/unwatched"""
@@ -76,6 +170,48 @@ class WatchStatusManager:
                 conn.commit()
         except Exception as e:
             logging.error(f"Error updating watch progress: {str(e)}")
+
+    def touch_last_watched(self, file_path, timestamp=None):
+        """Update only the last_watched timestamp for a file without changing watched/progress unless necessary.
+
+        If the row exists, preserve watched, progress and media_length fields. If not, insert a new row with defaults.
+        """
+        try:
+            ts = timestamp or datetime.now().isoformat()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT watched, progress, media_length FROM watch_status WHERE file_path = ?', (file_path,))
+                row = cursor.fetchone()
+                if row:
+                    watched = bool(row[0])
+                    progress = float(row[1]) if row[1] is not None else 0.0
+                    media_length = row[2]
+                else:
+                    watched = False
+                    progress = 0.0
+                    media_length = None
+                cursor.execute('''
+                    INSERT OR REPLACE INTO watch_status
+                    (file_path, watched, progress, last_watched, media_length)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (file_path, watched, progress, ts, media_length))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error touching last_watched for {file_path}: {str(e)}")
+
+    def clear_all_last_watched(self):
+        """Clear the last_watched timestamp for all entries in the DB.
+
+        This keeps watch progress/watched flags intact but removes the ordering
+        so Recently Watched will no longer show items from the DB.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE watch_status SET last_watched = NULL')
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error clearing last_watched timestamps: {str(e)}")
 
     def is_watched(self, file_path):
         """Return True if the file is marked watched in DB, False otherwise."""
