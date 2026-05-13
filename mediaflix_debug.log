@@ -1,0 +1,39 @@
+2025-11-19 15:14:16,231 - INFO - Starting Mediaflix with enhanced duplicate prevention...
+2025-11-19 15:14:16,231 - INFO - Duplicate detection enabled for movies, series, and episodes
+2025-11-19 15:14:16,233 - ERROR - Failed to load user settings: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)
+2025-11-19 15:14:16,233 - INFO - Loaded user settings: {'use_bundled_fonts': True}
+2025-11-19 15:14:16,251 - INFO - Loaded custom fonts: ['Netflix Sans ', 'Netflix Sans Light', 'Netflix Sans Med', 'Netflix Sans']
+2025-11-19 15:14:16,252 - INFO - Applied font rendering optimizations
+2025-11-19 15:14:25,340 - INFO - Internet detected - 42 backdrops already cached, skipping automatic preload
+2025-11-19 15:14:53,824 - INFO - Starting background fetch for More Like This id=1007734 type=movie
+2025-11-19 15:15:27,592 - INFO - Background fetch completed for id=1007734 got=12
+2025-11-19 15:15:45,545 - INFO - Starting background fetch for More Like This id=1054867 type=movie
+2025-11-19 15:16:19,170 - INFO - Background fetch completed for id=1054867 got=12
+2025-11-19 15:17:29,794 - INFO - Starting Mediaflix with enhanced duplicate prevention...
+2025-11-19 15:17:29,794 - INFO - Duplicate detection enabled for movies, series, and episodes
+2025-11-19 15:17:29,796 - ERROR - Failed to load user settings: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)
+2025-11-19 15:17:29,796 - INFO - Loaded user settings: {'use_bundled_fonts': True}
+2025-11-19 15:17:29,815 - INFO - Loaded custom fonts: ['Netflix Sans ', 'Netflix Sans Light', 'Netflix Sans Med', 'Netflix Sans']
+2025-11-19 15:17:29,816 - INFO - Applied font rendering optimizations
+2025-11-19 15:17:39,525 - INFO - Internet detected - 43 backdrops already cached, skipping automatic preload
+2025-11-19 15:17:40,937 - INFO - Running forced recommendation test: fetching popular movie
+2025-11-19 15:17:41,381 - INFO - Forced test: opening details for popular movie id=1062722 title=Frankenstein
+2025-11-19 15:17:47,700 - INFO - Starting background fetch for More Like This id=1062722 type=movie
+2025-11-19 15:17:58,783 - INFO - Starting background fetch for More Like This id=1108427 type=movie
+2025-11-19 15:18:18,269 - INFO - Opening YouTube search for: Moana 2026 trailer
+2025-11-19 15:18:21,364 - INFO - Background fetch completed for id=1108427 got=12
+2025-11-19 15:18:23,636 - INFO - Background fetch completed for id=1062722 got=12
+2025-11-19 15:20:01,433 - INFO - Starting background fetch for More Like This id=1108427 type=movie
+2025-11-19 15:20:01,434 - INFO - Background fetch completed for id=1108427 got=12
+2025-11-19 15:20:07,299 - INFO - Opening YouTube search for: Moana 2026 trailer
+2025-11-19 15:20:54,395 - INFO - Starting Mediaflix with enhanced duplicate prevention...
+2025-11-19 15:20:54,395 - INFO - Duplicate detection enabled for movies, series, and episodes
+2025-11-19 15:20:54,396 - ERROR - Failed to load user settings: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)
+2025-11-19 15:20:54,396 - INFO - Loaded user settings: {'use_bundled_fonts': True}
+2025-11-19 15:20:54,414 - INFO - Loaded custom fonts: ['Netflix Sans ', 'Netflix Sans Light', 'Netflix Sans Med', 'Netflix Sans']
+2025-11-19 15:20:54,415 - INFO - Applied font rendering optimizations
+2025-11-19 15:21:03,791 - INFO - Internet detected - 44 backdrops already cached, skipping automatic preload
+2025-11-19 15:21:05,180 - INFO - Running forced recommendation test: fetching popular movie
+2025-11-19 15:21:05,553 - INFO - Forced test: opening details for popular movie id=1062722 title=Frankenstein
+2025-11-19 15:21:10,711 - INFO - Starting background fetch for More Like This id=1062722 type=movie
+2025-11-19 15:21:40,953 - INFO - Background fetch completed for id=1062722 got=12
